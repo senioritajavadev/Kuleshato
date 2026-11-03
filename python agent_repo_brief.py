@@ -133,7 +133,7 @@ def chat():
         "model": MODEL,
         "messages": history,
         "stream": False,
-        "think": False,          # <--- ДОБАВЛЕНО: отключаем режим размышлений
+        "think": False,          # отключен режим размышлений
     })
 
     # ОТЛАДКА
