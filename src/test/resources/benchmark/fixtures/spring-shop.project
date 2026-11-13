@@ -1,0 +1,161 @@
+=== README.md ===
+# Shop
+
+Shop is a Spring Boot online store split into catalog and web modules.
+=== pom.xml ===
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.3.1</version>
+  </parent>
+  <groupId>com.shop</groupId>
+  <artifactId>shop-parent</artifactId>
+  <version>0.9.0</version>
+  <packaging>pom</packaging>
+  <properties>
+    <java.version>21</java.version>
+  </properties>
+  <modules>
+    <module>catalog</module>
+    <module>web</module>
+  </modules>
+</project>
+=== catalog/pom.xml ===
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.shop</groupId>
+    <artifactId>shop-parent</artifactId>
+    <version>0.9.0</version>
+  </parent>
+  <artifactId>catalog</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+=== web/pom.xml ===
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.shop</groupId>
+    <artifactId>shop-parent</artifactId>
+    <version>0.9.0</version>
+  </parent>
+  <artifactId>web</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.shop</groupId>
+      <artifactId>catalog</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>
+=== web/src/main/resources/application.yml ===
+server:
+  port: 8081
+spring:
+  datasource:
+    password: ${DB_PASSWORD:sh0p-dev-pass}
+=== catalog/src/main/java/com/shop/catalog/Product.java ===
+package com.shop.catalog;
+
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+
+@Entity
+public class Product {
+    @Id
+    private Long id;
+    private String name;
+}
+=== catalog/src/main/java/com/shop/catalog/ProductRepository.java ===
+package com.shop.catalog;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface ProductRepository extends JpaRepository<Product, Long> {
+}
+=== catalog/src/main/java/com/shop/catalog/PriceCalculator.java ===
+package com.shop.catalog;
+
+import java.math.BigDecimal;
+
+public final class PriceCalculator {
+    public BigDecimal retailPrice(BigDecimal base) {
+<<repeat 120:         // retail pricing rule placeholder: tax tables, rounding and regional adjustments>>
+        return base;
+    }
+
+    public BigDecimal seasonalPrice(BigDecimal base) {
+<<repeat 120:         // seasonal pricing rule placeholder: calendars, campaigns and regional adjustments>>
+        return base;
+    }
+
+    public BigDecimal wholesaleDiscount(BigDecimal price, int quantity) {
+        if (quantity >= 100) return price.multiply(new BigDecimal("0.85"));
+        return price;
+    }
+}
+=== web/src/main/java/com/shop/web/ShopApplication.java ===
+package com.shop.web;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class ShopApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ShopApplication.class, args);
+    }
+}
+=== web/src/main/java/com/shop/web/ProductController.java ===
+package com.shop.web;
+
+import com.shop.catalog.Product;
+import com.shop.catalog.ProductRepository;
+import java.util.List;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class ProductController {
+    private final ProductRepository repository;
+
+    public ProductController(ProductRepository repository) {
+        this.repository = repository;
+    }
+
+    @GetMapping("/products")
+    public List<Product> products() {
+        return repository.findAll();
+    }
+}
+=== web/src/test/java/com/shop/web/ProductControllerTest.java ===
+package com.shop.web;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.test.context.SpringBootTest;
+
+@SpringBootTest
+class ProductControllerTest {
+    @Test
+    void contextLoads() {
+    }
+}

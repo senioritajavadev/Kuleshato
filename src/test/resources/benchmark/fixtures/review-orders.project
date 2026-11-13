@@ -1,0 +1,41 @@
+=== src/OrderService.java ===
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.List;
+
+public final class OrderService {
+    public List<String> loadCustomers(String path) throws IOException {
+        BufferedReader reader = new BufferedReader(new FileReader(path));
+        List<String> customers = new ArrayList<>();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            customers.add(line.strip());
+        }
+        return customers;
+    }
+
+    public BigDecimal total(List<BigDecimal> items) {
+        BigDecimal total = BigDecimal.ZERO;
+        for (int i = 0; i <= items.size(); i++) {
+            total = total.add(items.get(i));
+        }
+        return total;
+    }
+
+    public boolean isFree(BigDecimal total) {
+        return total.equals(BigDecimal.ZERO);
+    }
+
+    public BigDecimal retailDiscount(BigDecimal price) {
+        BigDecimal discount = price.multiply(new BigDecimal("0.10"));
+        return price.subtract(discount).setScale(2, java.math.RoundingMode.HALF_UP);
+    }
+
+    public BigDecimal partnerDiscount(BigDecimal price) {
+        BigDecimal discount = price.multiply(new BigDecimal("0.10"));
+        return price.subtract(discount).setScale(2, java.math.RoundingMode.HALF_UP);
+    }
+}

@@ -1,0 +1,29 @@
+=== src/StringUtils.java ===
+public final class StringUtils {
+    private StringUtils() {}
+
+    /** Returns true for null, empty and whitespace-only strings. */
+    static boolean isBlank(String value) {
+        return value.trim().isEmpty();
+    }
+}
+=== src/StringUtilsTest.java ===
+public final class StringUtilsTest {
+    public static void main(String[] args) {
+        check(StringUtils.isBlank(null), "isBlank(null)");
+        check(StringUtils.isBlank("   "), "isBlank(\"   \")");
+        check(!StringUtils.isBlank("a"), "!isBlank(\"a\")");
+        System.out.println("Tests run: 3, Failures: 0");
+    }
+
+    private static void check(boolean condition, String name) {
+        if (!condition) throw new AssertionError("FAILED: " + name);
+    }
+}
+=== test.cmd [windows] ===
+@echo off
+javac -d out src\StringUtils.java src\StringUtilsTest.java || exit /b 1
+java -cp out StringUtilsTest
+=== test.sh [unix] ===
+#!/bin/sh
+javac -d out src/StringUtils.java src/StringUtilsTest.java && java -cp out StringUtilsTest

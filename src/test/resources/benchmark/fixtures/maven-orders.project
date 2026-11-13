@@ -1,0 +1,130 @@
+=== README.md ===
+# Orders Service
+
+Orders Service is a REST backend that stores customer orders in PostgreSQL.
+
+## Build
+
+```shell
+./mvnw verify
+```
+=== pom.xml ===
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>orders</artifactId>
+  <version>1.4.0</version>
+  <properties>
+    <java.version>17</java.version>
+    <postgres.version>42.7.3</postgres.version>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <version>${postgres.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.10.2</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <version>3.2.5</version>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+=== mvnw ===
+#!/bin/sh
+exec java -jar .mvn/wrapper/maven-wrapper.jar "$@"
+=== mvnw.cmd ===
+@echo off
+java -jar .mvn\wrapper\maven-wrapper.jar %*
+=== .mvn/wrapper/maven-wrapper.properties ===
+distributionUrl=https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.9.6/apache-maven-3.9.6-bin.zip
+=== .github/workflows/ci.yml ===
+name: CI
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - run: ./mvnw -B verify
+=== src/main/resources/application.properties ===
+spring.datasource.url=jdbc:postgresql://db.internal:5432/orders
+spring.datasource.password=Pr0d-Secret-42
+=== src/main/java/com/example/orders/OrdersApplication.java ===
+package com.example.orders;
+
+public final class OrdersApplication {
+    public static void main(String[] args) throws Exception {
+        OrderRepository repository = new OrderRepository(System.getenv("ORDERS_DB_URL"));
+        new OrderController(repository).start(8080);
+    }
+}
+=== src/main/java/com/example/orders/OrderRepository.java ===
+package com.example.orders;
+
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+
+final class OrderRepository {
+    private final String url;
+
+    OrderRepository(String url) {
+        this.url = url == null ? "jdbc:postgresql://localhost:5432/orders" : url;
+    }
+
+    void save(String customer, long amountCents) throws Exception {
+        try (Connection connection = DriverManager.getConnection(url);
+             PreparedStatement insert = connection.prepareStatement(
+                 "INSERT INTO orders(customer, amount_cents) VALUES (?, ?)")) {
+            insert.setString(1, customer);
+            insert.setLong(2, amountCents);
+            insert.executeUpdate();
+        }
+    }
+}
+=== src/main/java/com/example/orders/OrderController.java ===
+package com.example.orders;
+
+import com.sun.net.httpserver.HttpServer;
+import java.net.InetSocketAddress;
+
+final class OrderController {
+    private final OrderRepository repository;
+
+    OrderController(OrderRepository repository) {
+        this.repository = repository;
+    }
+
+    void start(int port) throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+        server.createContext("/orders", exchange -> exchange.sendResponseHeaders(201, -1));
+        server.start();
+    }
+}
+=== src/test/java/com/example/orders/OrderRepositoryTest.java ===
+package com.example.orders;
+
+import org.junit.jupiter.api.Test;
+
+class OrderRepositoryTest {
+    @Test
+    void createsRepository() {
+        new OrderRepository(null);
+    }
+}

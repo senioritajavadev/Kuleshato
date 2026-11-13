@@ -1,0 +1,21 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      # test.ps1 запускает Java test suite, включая эталонный набор (ProjectBenchmark) с порогами качества.
+      - name: Tests and reference benchmark
+        shell: pwsh
+        run: .\test.ps1
+      - name: Benchmark report
+        shell: pwsh
+        run: .\benchmark.ps1
+      - name: Build
+        shell: pwsh
+        run: .\build.ps1

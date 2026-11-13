@@ -1,0 +1,23 @@
+=== README.md ===
+# Calc
+
+Calc is a tiny command-line calculator written in plain Java without a build tool.
+=== test.sh ===
+#!/bin/sh
+javac -d out src/Calc.java src/CalcTest.java && java -ea -cp out CalcTest
+=== src/Calc.java ===
+public final class Calc {
+    static int add(int left, int right) {
+        return left + right;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(add(Integer.parseInt(args[0]), Integer.parseInt(args[1])));
+    }
+}
+=== src/CalcTest.java ===
+public final class CalcTest {
+    public static void main(String[] args) {
+        assert Calc.add(2, 3) == 5;
+    }
+}

@@ -1,0 +1,69 @@
+=== gradle/libs.versions.toml ===
+[versions]
+junit = "5.10.2"
+boot = "3.3.1"
+
+[libraries]
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
+guava = "com.google.guava:guava:33.2.1-jre"
+jackson-databind = { group = "com.fasterxml.jackson.core", name = "jackson-databind", version = "2.17.1" }
+
+[plugins]
+spring-boot = { id = "org.springframework.boot", version.ref = "boot" }
+=== settings.gradle.kts ===
+rootProject.name = "inventory"
+=== build.gradle.kts ===
+plugins {
+    java
+    alias(libs.plugins.spring.boot)
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+dependencies {
+    implementation(libs.guava)
+    implementation(libs.jackson.databind)
+    testImplementation(libs.junit.jupiter)
+    implementation(libs.missing.lib)
+}
+
+tasks.withType<Test> {
+    useJUnitPlatform()
+}
+=== gradlew.bat ===
+@rem Gradle startup script for Windows
+=== src/main/java/com/inv/Inventory.java ===
+package com.inv;
+
+import com.google.common.collect.ImmutableList;
+import java.util.List;
+
+public final class Inventory {
+    private final List<String> items;
+
+    public Inventory(List<String> items) {
+        this.items = ImmutableList.copyOf(items);
+    }
+
+    public int size() {
+        return items.size();
+    }
+}
+=== src/test/java/com/inv/InventoryTest.java ===
+package com.inv;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+import java.util.List;
+import org.junit.jupiter.api.Test;
+
+class InventoryTest {
+    @Test
+    void countsItems() {
+        assertEquals(2, new Inventory(List.of("bolt", "nut")).size());
+    }
+}

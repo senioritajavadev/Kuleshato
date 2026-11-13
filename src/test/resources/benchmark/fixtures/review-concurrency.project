@@ -1,0 +1,35 @@
+=== src/Stats.java ===
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.concurrent.atomic.AtomicLong;
+
+/** Счётчики веб-сервера; все методы вызываются одновременно из потоков обработки запросов. */
+public final class Stats {
+    private static final SimpleDateFormat FORMAT = new SimpleDateFormat("yyyy-MM-dd");
+    private static Stats instance;
+    private long requests;
+    private final AtomicLong errors = new AtomicLong();
+
+    public static Stats get() {
+        if (instance == null) {
+            instance = new Stats();
+        }
+        return instance;
+    }
+
+    public void onRequest() {
+        requests++;
+    }
+
+    public void onError() {
+        errors.incrementAndGet();
+    }
+
+    public long requests() {
+        return requests;
+    }
+
+    public String today() {
+        return FORMAT.format(new Date());
+    }
+}

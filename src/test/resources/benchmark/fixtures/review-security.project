@@ -1,0 +1,42 @@
+=== src/UserDao.java ===
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+/** Доступ к пользователям; login, fileName и role приходят из HTTP-запроса. */
+public final class UserDao {
+    private final Connection connection;
+    private final Path uploads;
+
+    public UserDao(Connection connection, Path uploads) {
+        this.connection = connection;
+        this.uploads = uploads;
+    }
+
+    public boolean exists(String login) throws Exception {
+        try (Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery("SELECT 1 FROM users WHERE login = '" + login + "'")) {
+            return result.next();
+        }
+    }
+
+    public boolean existsSafely(String login) throws Exception {
+        try (PreparedStatement statement = connection.prepareStatement("SELECT 1 FROM users WHERE login = ?")) {
+            statement.setString(1, login);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next();
+            }
+        }
+    }
+
+    public byte[] avatar(String fileName) throws Exception {
+        return Files.readAllBytes(uploads.resolve(fileName));
+    }
+
+    public boolean isAdmin(String role) {
+        return role == "admin";
+    }
+}
