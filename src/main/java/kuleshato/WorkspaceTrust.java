@@ -24,6 +24,11 @@ import java.util.TreeMap;
  * файлы из склонированного проекта не загружаются, пока пользователь их не одобрит. Хэши одобренных файлов хранятся
  * вне проекта ({@code ~/.kuleshato/trust.json}), чтобы сам репозиторий не мог объявить себя доверенным; изменение
  * или появление файла требует нового одобрения.
+ *
+ * <p>Файлы сборки ({@code pom.xml}, {@code build.gradle}…) тоже исполняемые данные: при {@code mvn test} выполняются
+ * их плагины. Но их меняют постоянно, поэтому их изменение не выгружает память и навыки, а только выключает автозапуск
+ * проверок, пока пользователь не посмотрит изменения. Для изменившегося файла Kuleshato показывает diff относительно
+ * одобренной версии: её копия хранится рядом с {@code trust.json}, вне проекта.
  */
 final class WorkspaceTrust {
     enum State {
@@ -40,8 +45,18 @@ final class WorkspaceTrust {
     record Change(String path, String kind, long size) {}
 
     record Status(State state, List<Change> changes) {
+        /** Память, навыки и скрипты проверки одобрены (изменения файлов сборки на это не влияют). */
         boolean trusted() {
-            return state == State.NOTHING || state == State.TRUSTED;
+            return state == State.NOTHING || state == State.TRUSTED || changes.stream().allMatch(change -> isBuildFile(change.path()));
+        }
+
+        /** Файлы сборки не менялись с одобрения — проверки Maven/Gradle можно запускать автоматически. */
+        boolean buildTrusted() {
+            return state == State.NOTHING || state == State.TRUSTED || changes.stream().noneMatch(change -> isBuildFile(change.path()));
+        }
+
+        boolean fullyTrusted() {
+            return trusted() && buildTrusted();
         }
     }
 
@@ -52,6 +67,13 @@ final class WorkspaceTrust {
         "test.ps1", "test.sh", "test.bat", "test.cmd", "build.ps1", "build.sh", "build.bat", "build.cmd",
         "mvnw", "mvnw.cmd", "gradlew", "gradlew.bat",
         ".mvn/wrapper/maven-wrapper.properties", "gradle/wrapper/gradle-wrapper.properties");
+    private static final java.util.Set<String> BUILD_FILES = java.util.Set.of(
+        "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts");
+    private static final java.util.Set<String> SKIP = java.util.Set.of(
+        ".git", ".idea", ".gradle", ".kuleshato", "build", "out", "target", "node_modules", "dist");
+    private static final int MAX_BUILD_DEPTH = 4;
+    private static final long MAX_COPY_BYTES = 256 * 1024;
+    private static final int MAX_DIFF_LINES = 40;
 
     private final Path store;
 
@@ -83,7 +105,39 @@ final class WorkspaceTrust {
             Path path = workspace.resolve(script);
             if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)) result.put(script, hash(path));
         }
+        for (Path build : buildFiles(workspace)) result.put(relative(workspace, build), hash(build));
         return result;
+    }
+
+    /** Файлы сборки корня и модулей (до {@value #MAX_BUILD_DEPTH} уровней), без каталогов сборки и IDE. */
+    private static List<Path> buildFiles(Path workspace) throws IOException {
+        List<Path> result = new ArrayList<>();
+        Files.walkFileTree(workspace, java.util.EnumSet.noneOf(java.nio.file.FileVisitOption.class), MAX_BUILD_DEPTH,
+            new java.nio.file.SimpleFileVisitor<>() {
+                @Override
+                public java.nio.file.FileVisitResult preVisitDirectory(Path dir, java.nio.file.attribute.BasicFileAttributes attrs) {
+                    return !dir.equals(workspace) && SKIP.contains(dir.getFileName().toString())
+                        ? java.nio.file.FileVisitResult.SKIP_SUBTREE : java.nio.file.FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public java.nio.file.FileVisitResult visitFile(Path file, java.nio.file.attribute.BasicFileAttributes attrs) {
+                    if (BUILD_FILES.contains(file.getFileName().toString()) && result.size() < 50) result.add(file);
+                    return java.nio.file.FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public java.nio.file.FileVisitResult visitFileFailed(Path file, IOException error) {
+                    return java.nio.file.FileVisitResult.CONTINUE;
+                }
+            });
+        result.sort(null);
+        return result;
+    }
+
+    static boolean isBuildFile(String relativePath) {
+        String path = relativePath.replace('\\', '/');
+        return BUILD_FILES.contains(path.substring(path.lastIndexOf('/') + 1));
     }
 
     Status check(Path root) throws IOException {
@@ -103,8 +157,12 @@ final class WorkspaceTrust {
     /** Одобряет текущее состояние всех найденных файлов. */
     void approve(Path root) throws IOException {
         Map<String, Object> all = readStore();
-        all.put(key(root), new LinkedHashMap<>(fingerprint(root)));
+        Map<String, String> current = fingerprint(root);
+        all.put(key(root), new LinkedHashMap<>(current));
         writeStore(all);
+        Path copies = copies(root);
+        deleteTree(copies);
+        for (String path : current.keySet()) copy(root, path);
     }
 
     /**
@@ -121,17 +179,86 @@ final class WorkspaceTrust {
         entry.put(path, current.get(path));
         all.put(key(root), entry);
         writeStore(all);
+        copy(root, path);
     }
 
     void revoke(Path root) throws IOException {
         Map<String, Object> all = readStore();
         if (all.remove(key(root)) != null) writeStore(all);
+        deleteTree(copies(root));
+    }
+
+    /**
+     * Что изменилось в файле с момента одобрения — diff относительно сохранённой копии; для нового файла — его начало.
+     * {@code null}, если копии нет или файл не текстовый.
+     */
+    String diff(Path root, Change change) {
+        try {
+            Path current = root.toRealPath().resolve(change.path());
+            if (!Files.isRegularFile(current, LinkOption.NOFOLLOW_LINKS) || Files.size(current) > MAX_COPY_BYTES) return null;
+            String now = text(current);
+            if (now == null) return null;
+            String before = "";
+            if (change.kind().equals("изменён")) {
+                Path saved = copyPath(root, change.path());
+                if (saved == null || !Files.isRegularFile(saved)) return null;
+                before = text(saved);
+                if (before == null) return null;
+            }
+            String diff = WorkspaceTools.formatDiff(change.path(), before, now);
+            List<String> lines = diff.lines().toList();
+            if (lines.size() <= MAX_DIFF_LINES) return diff;
+            return String.join("\n", lines.subList(0, MAX_DIFF_LINES)) + "\n … ещё " + (lines.size() - MAX_DIFF_LINES) + " строк";
+        } catch (IOException error) {
+            return null;
+        }
+    }
+
+    private static String text(Path file) throws IOException {
+        byte[] bytes = Files.readAllBytes(file);
+        for (byte value : bytes) if (value == 0) return null;
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    /** Каталог копий одобренных файлов этого проекта: рядом с {@code trust.json}, по хэшу пути проекта. */
+    private Path copies(Path root) throws IOException {
+        String id = HexFormat.of().formatHex(sha256().digest(key(root).getBytes(StandardCharsets.UTF_8))).substring(0, 32);
+        return store.resolveSibling("trusted").resolve(id);
+    }
+
+    private Path copyPath(Path root, String relativePath) throws IOException {
+        Path base = copies(root);
+        Path target = base.resolve(relativePath).normalize();
+        return target.startsWith(base) ? target : null;
+    }
+
+    private void copy(Path root, String relativePath) throws IOException {
+        Path source = root.toRealPath().resolve(relativePath);
+        Path target = copyPath(root, relativePath);
+        if (target == null || !Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS) || Files.size(source) > MAX_COPY_BYTES) return;
+        Files.createDirectories(target.getParent());
+        Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    private static void deleteTree(Path directory) throws IOException {
+        if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) return;
+        try (var paths = Files.walk(directory)) {
+            for (Path path : paths.sorted(java.util.Comparator.reverseOrder()).toList()) Files.deleteIfExists(path);
+        }
+    }
+
+    private static MessageDigest sha256() throws IOException {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException error) {
+            throw new IOException("SHA-256 недоступен", error);
+        }
     }
 
     /** Относится ли путь к файлам, которым нужно доверие (для обновления хэша после собственной записи). */
     static boolean isTracked(String relativePath) {
         String path = relativePath.replace('\\', '/');
-        return path.startsWith(".kuleshato/") || ROOT_SCRIPTS.contains(path);
+        return path.startsWith(".kuleshato/") || ROOT_SCRIPTS.contains(path) || isBuildFile(path);
     }
 
     private Map<String, String> approved(Path root) throws IOException {
@@ -204,21 +331,31 @@ final class WorkspaceTrust {
 
     /** Текст запроса доверия: что найдено и что это меняет. */
     static String describe(Status status) {
+        return describe(status, false);
+    }
+
+    /** {@code verbose} — с размерами файлов. */
+    static String describe(Status status, boolean verbose) {
         boolean scriptsOnly = scriptsOnly(status);
+        boolean buildOnly = status.changes().stream().allMatch(change -> isBuildFile(change.path()));
         StringBuilder text = new StringBuilder(status.state() == State.CHANGED
-            ? "Файлы, влияющие на поведение Kuleshato, изменились с момента одобрения:\n"
-            : scriptsOnly
-                ? "В проекте есть скрипты проверки — после правок Kuleshato может запускать их без подтверждения:\n"
-                : "В проекте уже есть файлы, которые меняют поведение Kuleshato:\n");
+            ? buildOnly
+                ? "Файлы сборки изменились с момента одобрения — проверка (например, mvn test) выполнит их плагины:\n"
+                : "Файлы, влияющие на поведение Kuleshato, изменились с момента одобрения:\n"
+            : buildOnly
+                ? "В проекте есть файлы сборки — после правок Kuleshato запускает проверку, и она выполняет плагины из них:\n"
+                : scriptsOnly
+                    ? "В проекте есть скрипты проверки — после правок Kuleshato может запускать их без подтверждения:\n"
+                    : "В проекте уже есть файлы, которые меняют поведение Kuleshato:\n");
         for (Change change : status.changes()) {
             text.append("  ").append(change.kind()).append(": ").append(change.path())
-                .append(change.size() >= 0 ? " (" + change.size() + " байт)" : "").append(" — ").append(purpose(change.path())).append('\n');
+                .append(verbose && change.size() >= 0 ? " (" + change.size() + " байт)" : "").append(" — ").append(purpose(change.path())).append('\n');
         }
         List<String> effects = new ArrayList<>();
         if (status.changes().stream().anyMatch(change -> change.path().equals(".kuleshato/memory.md"))) effects.add("память проекта не загружается");
         if (status.changes().stream().anyMatch(change -> change.path().startsWith(".kuleshato/skills/"))) effects.add("навыки проекта не загружаются");
         if (status.changes().stream().anyMatch(change -> !change.path().startsWith(".kuleshato/"))) {
-            effects.add("скрипты проверки запускаются только с подтверждением");
+            effects.add("проверки запускаются только с подтверждением");
         }
         if (!effects.isEmpty()) text.append("Без одобрения ").append(String.join(", ", effects)).append(".\n");
         text.append(scriptsOnly
@@ -229,6 +366,9 @@ final class WorkspaceTrust {
 
     /** Вопрос пользователю: при одних скриптах проверки речь об автозапуске, а не о «доверии к файлам». */
     static String question(Status status) {
+        if (status.changes().stream().allMatch(change -> isBuildFile(change.path()))) {
+            return "Разрешить автозапуск проверок в этом проекте? [y/N] ";
+        }
         return scriptsOnly(status) ? "Разрешить автозапуск этих скриптов? [y/N] " : "Доверять этим файлам? [y/N] ";
     }
 
@@ -241,6 +381,7 @@ final class WorkspaceTrust {
         if (path.startsWith(".kuleshato/skills/")) return "навык: инструкции модели";
         if (path.equals(".kuleshato/config.json")) return "настройки";
         if (path.startsWith(".kuleshato/")) return "файл Kuleshato";
+        if (isBuildFile(path)) return "файл сборки: при проверке выполняются его плагины";
         return "скрипт проверки или сборки: запускается автоматически";
     }
 }

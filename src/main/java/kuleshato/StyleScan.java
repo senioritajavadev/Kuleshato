@@ -6,11 +6,14 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 
 /**
@@ -18,9 +21,11 @@ import java.util.regex.Pattern;
  *
  * <p>Вопрос «проверь код на консистентность и единый стиль» небольшая модель в цикле инструментов решает плохо:
  * читает файлы по одному, тратит окно контекста и не видит проект целиком. Механические правила (отступы, переводы
- * строк, длина строк, импорты, скобки) приложение проверяет само: для каждого правила — что принято в большинстве
- * файлов (или объявлено в {@code .editorconfig}) и где отклонения с {@code файл:строка}. Смысловую согласованность
- * так не проверить; для неё — {@code /review}.
+ * строк, длина строк, импорты, скобки) приложение проверяет само.
+ *
+ * <p>Отчёт написан для начинающего: сначала то, что стоит поправить, — с объяснением, почему это важно, и примерами;
+ * затем одна строка о том, что в порядке; в конце — что можно попросить. Разбивка по вариантам — в подробном режиме.
+ * Переводы строк не считаются проблемой, если их при коммите выравнивает Git.
  */
 final class StyleScan {
     private static final Pattern QUESTION = Pattern.compile(
@@ -38,14 +43,16 @@ final class StyleScan {
         return !prompt.startsWith("/") && QUESTION.matcher(prompt).find();
     }
 
-    /** Правило: сколько файлов следуют каждому варианту и примеры строк для отклонений. */
+    /** Правило с выбором варианта: сколько файлов следуют каждому варианту и где отклонения. */
     private static final class Rule {
-        final String title;
+        final String name;
+        final String technical;
         final Map<String, List<String>> variants = new LinkedHashMap<>();
         String declared;
 
-        Rule(String title) {
-            this.title = title;
+        Rule(String name, String technical) {
+            this.name = name;
+            this.technical = technical;
         }
 
         void add(String variant, String where) {
@@ -63,61 +70,105 @@ final class StyleScan {
             return variants.keySet().stream().allMatch(variant -> variant.equals(expected));
         }
 
-        String render() {
-            StringBuilder text = new StringBuilder(title).append(": ");
+        List<String> deviations() {
+            List<String> result = new ArrayList<>();
+            variants.forEach((variant, places) -> {
+                if (!variant.equals(expected())) result.addAll(places);
+            });
+            return result;
+        }
+
+        /** «в большинстве файлов — 4 пробела, а в 1 файле — табуляция». */
+        String plain(Function<String, String> human) {
             String expected = expected();
-            if (expected == null) return text.append("нет данных").toString();
-            text.append(expected).append(" — ").append(count(variants.getOrDefault(expected, List.of()).size()))
+            StringBuilder text = new StringBuilder(declared != null
+                ? "в .editorconfig указано — " + human.apply(expected)
+                : "в большинстве файлов — " + human.apply(expected));
+            List<String> others = new ArrayList<>();
+            variants.forEach((variant, places) -> {
+                if (!variant.equals(expected)) others.add("в " + inFiles(places.size()) + " — " + human.apply(variant));
+            });
+            return text.append(", а ").append(String.join(", ", others)).toString();
+        }
+
+        String technicalLine() {
+            String expected = expected();
+            if (expected == null) return technical + ": нет данных";
+            StringBuilder text = new StringBuilder(technical).append(": ").append(expected).append(" — ")
+                .append(files(variants.getOrDefault(expected, List.of()).size()))
                 .append(declared != null ? " (объявлено в .editorconfig)" : "");
-            if (consistent()) return text.append(" ✓").toString();
-            for (Map.Entry<String, List<String>> variant : variants.entrySet()) {
-                if (variant.getKey().equals(expected)) continue;
-                text.append("\n    отклонение: ").append(variant.getKey()).append(" — ").append(count(variant.getValue().size()))
-                    .append(": ").append(String.join(", ", variant.getValue().stream().limit(EXAMPLES).toList()))
-                    .append(variant.getValue().size() > EXAMPLES ? " …" : "");
-            }
+            variants.forEach((variant, places) -> {
+                if (!variant.equals(expected)) {
+                    text.append("; ").append(variant).append(" — ").append(files(places.size())).append(": ")
+                        .append(String.join(", ", places.stream().limit(EXAMPLES).toList())).append(places.size() > EXAMPLES ? " …" : "");
+                }
+            });
             return text.toString();
         }
     }
 
-    /** Нарушения правила «так быть не должно» (без выбора большинства): файлы и первые строки. */
+    /** То, чего быть не должно: файлы, первые строки и общее число строк. */
     private static final class Issue {
-        final String title;
+        final String name;
+        final String technical;
         final List<String> places = new ArrayList<>();
         int lines;
 
-        Issue(String title) {
-            this.title = title;
+        Issue(String name, String technical) {
+            this.name = name;
+            this.technical = technical;
         }
 
-        String render() {
-            if (places.isEmpty()) return title + ": нет ✓";
-            return title + ": " + count(places.size()) + (lines > places.size() ? ", строк: " + lines : "") + " — "
+        void add(String path, String where) {
+            if (places.isEmpty() || !places.get(places.size() - 1).startsWith(path + ":")) places.add(where);
+            lines++;
+        }
+
+        String technicalLine() {
+            if (places.isEmpty()) return technical + ": нет";
+            return technical + ": " + files(places.size()) + ", строк: " + lines + " — "
                 + String.join(", ", places.stream().limit(EXAMPLES).toList()) + (places.size() > EXAMPLES ? " …" : "");
         }
     }
 
     static String report(Path root) throws IOException {
+        return report(root, gitNormalizesLineEndings(root), false);
+    }
+
+    static String report(Path root, boolean verbose) throws IOException {
+        return report(root, gitNormalizesLineEndings(root), verbose);
+    }
+
+    /** {@code gitNormalizes} — Git сам выравнивает переводы строк, поэтому их различие в рабочей копии не проблема. */
+    static String report(Path root, boolean gitNormalizes, boolean verbose) throws IOException {
         Path workspace = root.toRealPath();
         List<Path> files = javaFiles(workspace);
-        if (files.isEmpty()) return "Java-файлы для проверки оформления не найдены.";
+        if (files.isEmpty()) return "Java-файлов для проверки оформления не нашлось.";
         Map<String, String> editorConfig = editorConfig(workspace);
         int maxLength = parseInt(editorConfig.get("max_line_length"), 120);
 
-        Rule indent = new Rule("Отступы");
-        Rule endings = new Rule("Переводы строк");
-        Rule braces = new Rule("Открывающая фигурная скобка");
-        Issue trailing = new Issue("Пробелы в конце строк");
-        Issue longLines = new Issue("Строки длиннее " + maxLength + " символов");
-        Issue wildcard = new Issue("Импорты со *");
-        Issue finalNewline = new Issue("Нет перевода строки в конце файла");
-        Issue bom = new Issue("BOM в начале файла");
+        Rule indent = new Rule("отступы", "Отступы");
+        Rule endings = new Rule("переводы строк", "Переводы строк");
+        Rule braces = new Rule("фигурные скобки", "Открывающая фигурная скобка");
+        Issue trailing = new Issue("пробелы в конце строк", "Пробелы в конце строк");
+        Issue longLines = new Issue("длина строк", "Строки длиннее " + maxLength + " символов");
+        Issue wildcard = new Issue("импорты", "Импорты со *");
+        Issue finalNewline = new Issue("конец файла", "Нет перевода строки в конце файла");
+        Issue bom = new Issue("кодировка", "BOM в начале файла");
         if ("tab".equals(editorConfig.get("indent_style"))) indent.declared = "табуляция";
         else if ("space".equals(editorConfig.get("indent_style"))) {
             indent.declared = "пробелы по " + parseInt(editorConfig.get("indent_size"), 4);
         }
         if ("lf".equals(editorConfig.get("end_of_line"))) endings.declared = "LF";
         if ("crlf".equals(editorConfig.get("end_of_line"))) endings.declared = "CRLF";
+
+        Map<String, Integer> names = new HashMap<>();
+        for (Path file : files) names.merge(file.getFileName().toString(), 1, Integer::sum);
+        Function<String, String> shortName = place -> {
+            String path = place.contains(":") ? place.substring(0, place.lastIndexOf(':')) : place;
+            String name = path.substring(path.lastIndexOf('/') + 1);
+            return names.getOrDefault(name, 0) == 1 ? name + place.substring(path.length()) : place;
+        };
 
         int scanned = 0;
         for (Path file : files) {
@@ -127,10 +178,10 @@ final class StyleScan {
             scanned++;
             String text = new String(bytes, StandardCharsets.UTF_8);
             if (text.startsWith("﻿")) {
-                bom.places.add(path);
+                bom.add(path, path);
                 text = text.substring(1);
             }
-            if (!text.isEmpty() && !text.endsWith("\n")) finalNewline.places.add(path);
+            if (!text.isEmpty() && !text.endsWith("\n")) finalNewline.add(path, path);
             int crlf = count(text, "\r\n");
             int lf = count(text, "\n") - crlf;
             if (crlf > 0 && lf > 0) endings.add("смешанные", path);
@@ -148,22 +199,11 @@ final class StyleScan {
                 boolean comment = inBlockComment || stripped.startsWith("*") || stripped.startsWith("/*") || stripped.startsWith("//");
                 if (stripped.startsWith("/*") && !stripped.contains("*/")) inBlockComment = true;
                 else if (inBlockComment && stripped.contains("*/")) inBlockComment = false;
-                if (!line.isEmpty() && Character.isWhitespace(line.charAt(line.length() - 1))) {
-                    if (trailing.places.isEmpty() || !trailing.places.get(trailing.places.size() - 1).startsWith(path + ":")) {
-                        trailing.places.add(where);
-                    }
-                    trailing.lines++;
-                }
+                if (!line.isEmpty() && Character.isWhitespace(line.charAt(line.length() - 1))) trailing.add(path, where);
                 if (line.length() > maxLength && !stripped.startsWith("import ") && !stripped.startsWith("package ")) {
-                    if (longLines.places.isEmpty() || !longLines.places.get(longLines.places.size() - 1).startsWith(path + ":")) {
-                        longLines.places.add(where);
-                    }
-                    longLines.lines++;
+                    longLines.add(path, where);
                 }
-                if (WILDCARD_IMPORT.matcher(line).find()) {
-                    wildcard.places.add(where);
-                    wildcard.lines++;
-                }
+                if (WILDCARD_IMPORT.matcher(line).find()) wildcard.add(path, where);
                 if (stripped.isEmpty() || comment) continue;
                 if (line.startsWith("\t")) {
                     tabs++;
@@ -172,8 +212,8 @@ final class StyleScan {
                     spaces++;
                     if (firstSpace == null) firstSpace = where;
                     int width = line.length() - line.stripLeading().length();
-                    if (line.stripLeading().startsWith(".") || line.stripLeading().startsWith("+")
-                        || line.stripLeading().startsWith("&&") || line.stripLeading().startsWith("||")) {
+                    String rest = line.stripLeading();
+                    if (rest.startsWith(".") || rest.startsWith("+") || rest.startsWith("&&") || rest.startsWith("||")) {
                         // Продолжение выражения выравнивают по-разному; ширину отступа по нему не определяем.
                     } else if (width % 4 == 0) by4++;
                     else if (width % 2 == 0) by2++;
@@ -185,11 +225,9 @@ final class StyleScan {
                 if (stripped.equals("{")) {
                     ownLine++;
                     if (firstOwnLine == null) firstOwnLine = where;
-                } else if (stripped.endsWith("{") && !stripped.startsWith("}")) {
-                    sameLine++;
-                    if (firstSameLine == null) firstSameLine = where;
                 } else if (stripped.endsWith("{")) {
                     sameLine++;
+                    if (firstSameLine == null && !stripped.startsWith("}")) firstSameLine = where;
                 }
             }
             if (tabs > 0 && spaces > 0) indent.add("смешанные табуляция и пробелы", tabs > spaces ? firstSpace : firstTab);
@@ -200,27 +238,156 @@ final class StyleScan {
                 else if (by4 + by2 >= 0.9 * total) indent.add("пробелы по 2", path);
                 else indent.add("пробелы разной ширины", firstOddIndent == null ? path : firstOddIndent);
             }
-            if (ownLine > 0 && sameLine > 0) braces.add("и на той же, и на отдельной строке",
-                ownLine < sameLine ? firstOwnLine : firstSameLine);
+            if (ownLine > 0 && sameLine > 0) braces.add("и на той же, и на отдельной строке", ownLine < sameLine ? firstOwnLine : firstSameLine);
             else if (ownLine > 0) braces.add("на отдельной строке", path);
             else if (sameLine > 0) braces.add("на той же строке", path);
         }
 
-        List<Rule> rules = List.of(indent, endings, braces);
-        List<Issue> issues = List.of(trailing, longLines, wildcard, finalNewline, bom);
-        long consistent = rules.stream().filter(Rule::consistent).count() + issues.stream().filter(issue -> issue.places.isEmpty()).count();
-        StringBuilder result = new StringBuilder("Оформление Java-кода: проверено файлов — ").append(scanned)
-            .append(" (приложением, по всем файлам, без модели")
-            .append(editorConfig.isEmpty() ? "; .editorconfig нет — эталон — вариант большинства файлов" : "; учтён .editorconfig")
-            .append(").\n");
-        for (Rule rule : rules) result.append("\n- ").append(rule.render());
-        for (Issue issue : issues) result.append("\n- ").append(issue.render());
-        result.append("\n\nЕдинообразно: ").append(consistent).append(" из ").append(rules.size() + issues.size()).append(" правил.");
-        if (files.size() > MAX_FILES) result.append(" Проверены первые ").append(MAX_FILES).append(" файлов.");
-        result.append("\nЭто механическая проверка оформления. Смысловую согласованность (именование, обработку ошибок, "
-            + "дублирование) так не проверить — для неё: /review <файл|каталог>. Исправить отклонения в конкретном файле "
-            + "можно просьбой, например: «убери пробелы в конце строк в src/…/Main.java».");
+        List<String> fix = new ArrayList<>();
+        List<String> fine = new ArrayList<>();
+        if (indent.consistent()) fine.add(indent.name);
+        else fix.add("Разные отступы: " + indent.plain(StyleScan::humanIndent) + ". В разных редакторах такой код съезжает."
+            + examples(indent.deviations(), shortName));
+        boolean endingsIgnored = !endings.consistent() && gitNormalizes && endings.declared == null;
+        if (endings.consistent()) fine.add(endings.name);
+        else if (endingsIgnored) fine.add("переводы строк (их выравнивает Git)");
+        else fix.add("Разные переводы строк: " + endings.plain(StyleScan::humanEnding)
+            + ". Git может показывать такие файлы изменёнными целиком." + examples(endings.deviations(), shortName));
+        if (braces.consistent()) fine.add(braces.name);
+        else fix.add("Фигурные скобки стоят по-разному: " + braces.plain(Function.identity()) + "."
+            + examples(braces.deviations(), shortName));
+        issue(fix, fine, trailing, "Лишние пробелы в конце строк: " + lineCount(trailing) + ". Их не видно, но они попадают "
+            + "в изменения Git и мешают сравнению версий.", shortName);
+        issue(fix, fine, longLines, "Длинные строки: " + lineCount(longLines) + " длиннее " + maxLength + " символов. Их неудобно "
+            + "читать — приходится прокручивать вбок. Это не ошибка, но такие строки лучше переносить.", shortName);
+        issue(fix, fine, wildcard, "Импорты со звёздочкой (вроде import java.util.*): " + lineCount(wildcard) + ". По ним не видно, "
+            + "какие классы на самом деле используются.", shortName);
+        issue(fix, fine, finalNewline, "Нет пустой строки в конце файла: " + inFilesCount(finalNewline) + ". Git отмечает это "
+            + "в изменениях как «No newline at end of file».", shortName);
+        issue(fix, fine, bom, "Невидимый символ BOM в начале файла: " + inFilesCount(bom) + ". Некоторые инструменты сборки "
+            + "на нём спотыкаются.", shortName);
+
+        StringBuilder result = new StringBuilder("Проверено оформление " + plural(scanned, "Java-файла", "Java-файлов", "Java-файлов") + ".\n");
+        if (fix.isEmpty()) {
+            result.append("\nОформление единообразное — замечаний нет.");
+        } else {
+            result.append("\nЧто стоит поправить:");
+            for (int i = 0; i < fix.size(); i++) result.append("\n").append(i + 1).append(". ").append(fix.get(i));
+        }
+        if (!fine.isEmpty()) result.append("\n\nВ порядке: ").append(String.join(", ", fine)).append('.');
+        if (files.size() >= MAX_FILES) result.append("\nПроверены первые ").append(MAX_FILES).append(" файлов.");
+        result.append("\n\n");
+        if (!fix.isEmpty()) {
+            String example = firstExample(List.of(longLines, trailing, wildcard), indent, shortName);
+            result.append("Что можно попросить: «").append(example).append("» — Kuleshato покажет изменения до записи. ");
+        }
+        result.append("Это проверка внешнего вида кода. Ошибки в логике и дублирование ищет /review <файл>.");
+        if (verbose) {
+            result.append("\n\nПодробно (").append(editorConfig.isEmpty()
+                ? ".editorconfig нет — эталон по большинству файлов" : "учтён .editorconfig")
+                .append(gitNormalizes ? "; Git выравнивает переводы строк" : "").append("):");
+            for (Rule rule : List.of(indent, endings, braces)) result.append("\n- ").append(rule.technicalLine());
+            for (Issue issue : List.of(trailing, longLines, wildcard, finalNewline, bom)) result.append("\n- ").append(issue.technicalLine());
+        }
         return result.toString();
+    }
+
+    private static void issue(List<String> fix, List<String> fine, Issue issue, String text, Function<String, String> shortName) {
+        if (issue.places.isEmpty()) fine.add(issue.name);
+        else fix.add(text + examples(issue.places, shortName));
+    }
+
+    private static String examples(List<String> places, Function<String, String> shortName) {
+        if (places.isEmpty()) return "";
+        return "\n   Например: " + String.join(", ", places.stream().limit(EXAMPLES).map(shortName).toList())
+            + (places.size() > EXAMPLES ? " и ещё " + (places.size() - EXAMPLES) : "");
+    }
+
+    private static String firstExample(List<Issue> issues, Rule indent, Function<String, String> shortName) {
+        for (Issue issue : issues) {
+            if (issue.places.isEmpty()) continue;
+            String file = fileOf(shortName.apply(issue.places.get(0)));
+            if (issue.technical.startsWith("Строки длиннее")) return "перенеси длинные строки в " + file;
+            if (issue.technical.startsWith("Пробелы")) return "убери пробелы в конце строк в " + file;
+            return "замени импорты со звёздочкой в " + file;
+        }
+        List<String> deviations = indent.deviations();
+        if (!deviations.isEmpty()) return "приведи отступы в " + fileOf(shortName.apply(deviations.get(0))) + " к остальным файлам";
+        return "исправь оформление в одном из файлов из списка";
+    }
+
+    private static String fileOf(String place) {
+        int colon = place.lastIndexOf(':');
+        return colon > 0 && place.substring(colon + 1).chars().allMatch(Character::isDigit) ? place.substring(0, colon) : place;
+    }
+
+    private static String humanIndent(String variant) {
+        return switch (variant) {
+            case "пробелы по 4" -> "4 пробела";
+            case "пробелы по 2" -> "2 пробела";
+            case "смешанные табуляция и пробелы" -> "табуляция вперемешку с пробелами";
+            case "пробелы разной ширины" -> "отступы разной ширины";
+            default -> variant;
+        };
+    }
+
+    private static String humanEnding(String variant) {
+        return switch (variant) {
+            case "CRLF" -> "как в Windows (CRLF)";
+            case "LF" -> "как в Linux и macOS (LF)";
+            default -> "разные внутри одного файла";
+        };
+    }
+
+    /** «498 строк в 24 файлах». */
+    private static String lineCount(Issue issue) {
+        String lines = plural(issue.lines, "строка", "строки", "строк");
+        return issue.places.size() == 1 ? lines + " в одном файле" : lines + " в " + inFiles(issue.places.size());
+    }
+
+    private static String inFilesCount(Issue issue) {
+        return plural(issue.places.size(), "файл", "файла", "файлов");
+    }
+
+    /** Предложный падеж: «в 1 файле», «в 24 файлах». */
+    private static String inFiles(int count) {
+        return count + (count % 10 == 1 && count % 100 != 11 ? " файле" : " файлах");
+    }
+
+    private static String files(int count) {
+        return plural(count, "файл", "файла", "файлов");
+    }
+
+    static String plural(int count, String one, String few, String many) {
+        int mod10 = count % 10, mod100 = count % 100;
+        String word = mod10 == 1 && mod100 != 11 ? one : mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14) ? few : many;
+        return count + " " + word;
+    }
+
+    /** Git выравнивает переводы строк при коммите: {@code .gitattributes} с {@code text=auto}/{@code eol=} или {@code core.autocrlf}. */
+    static boolean gitNormalizesLineEndings(Path root) {
+        try {
+            Path attributes = root.resolve(".gitattributes");
+            if (Files.isRegularFile(attributes) && Files.size(attributes) < 64 * 1024) {
+                String text = Files.readString(attributes, StandardCharsets.UTF_8);
+                if (text.contains("text=auto") || text.contains("eol=")) return true;
+            }
+            if (!Files.exists(root.resolve(".git"))) return false;
+            Process process = new ProcessBuilder("git", "config", "--get", "core.autocrlf")
+                .directory(root.toFile()).redirectErrorStream(true).start();
+            process.getOutputStream().close();
+            if (!process.waitFor(3, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                return false;
+            }
+            String value = new String(process.getInputStream().readNBytes(64), StandardCharsets.UTF_8).strip().toLowerCase(Locale.ROOT);
+            return value.equals("true") || value.equals("input");
+        } catch (IOException error) {
+            return false;
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
     }
 
     private static List<Path> javaFiles(Path root) throws IOException {
@@ -283,11 +450,5 @@ final class StyleScan {
         int count = 0;
         for (int index = text.indexOf(needle); index >= 0; index = text.indexOf(needle, index + needle.length())) count++;
         return count;
-    }
-
-    private static String count(int files) {
-        int mod10 = files % 10, mod100 = files % 100;
-        String word = mod10 == 1 && mod100 != 11 ? "файл" : mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14) ? "файла" : "файлов";
-        return files + " " + word;
     }
 }

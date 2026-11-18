@@ -29,6 +29,8 @@ public final class Main {
     private final WorkspaceTrust trust = new WorkspaceTrust();
     /** Одобрил ли пользователь память, навыки и скрипты проверки этого проекта ({@link WorkspaceTrust}). */
     private boolean trusted;
+    /** Файлы сборки не менялись с одобрения: проверки Maven/Gradle можно запускать без подтверждения. */
+    private boolean buildTrusted;
     /** Уроки без доказательства, которые пользователь в этой сессии отказался подтверждать. */
     private final java.util.Set<String> declinedManual = new java.util.HashSet<>();
     /** Где Ollama загрузила модель — по последней проверке {@code /api/ps}. */
@@ -51,6 +53,7 @@ public final class Main {
         Options options = parseArguments(args);
         if (options.help) { printHelp(); return; }
         if (options.version) { System.out.println("Kuleshato " + VERSION); return; }
+        ui.verbose(options.verbose);
         root = JavaProject.requireWorkspace(Path.of(options.cwd == null ? "." : options.cwd));
         settings = ProjectConfig.load(root);
         String envModel = System.getenv("KULESHATO_MODEL");
@@ -92,7 +95,8 @@ public final class Main {
         }
         ui.welcome(model, root.toString(), skillMaps(catalog.skills()), activeSkillNames());
         for (String warning : catalog.warnings()) System.err.println("Предупреждение навыков: " + warning);
-        System.out.println(options.resume == null ? "Новая сессия " + session.get("id") : "Продолжаю сессию " + session.get("id"));
+        if (options.resume != null) ui.progress("Продолжаю прошлый разговор.");
+        ui.detail("Сессия " + session.get("id") + " · модель " + model + " · окно контекста " + settings.contextWindow());
         interactive = System.console() != null;
         checkPlacementAtStart();
         repl();
@@ -105,6 +109,12 @@ public final class Main {
             if (line == null) break;
             String command = line.trim();
             if (command.isEmpty()) continue;
+            // «/рудз» — это /help, набранный в русской раскладке.
+            String layoutCommand = KeyboardLayout.command(command);
+            if (layoutCommand != null) {
+                ui.step("Понял как " + layoutCommand.split(" ", 2)[0] + " — команда была набрана в русской раскладке");
+                command = layoutCommand;
+            }
             if (command.equals("/exit") || command.equals("/quit")) break;
             try {
                 if (handleCommand(command)) continue;
@@ -122,7 +132,14 @@ public final class Main {
     }
 
     private boolean handleCommand(String command) throws Exception {
-        if (command.equals("/help")) { printHelp(); return true; }
+        if (command.equals("/help")) { ui.text(replHelp(catalog.skills(), activeSkillNames())); return true; }
+        if (command.equals("/details")) {
+            ui.verbose(!ui.verbose());
+            ui.progress(ui.verbose()
+                ? "Подробный режим включён: Kuleshato показывает технические детали — модель, токены, инструменты, ID сессии."
+                : "Подробный режим выключен.");
+            return true;
+        }
         if (command.equals("/clear")) {
             messages.subList(1, messages.size()).clear();
             save();
@@ -141,11 +158,12 @@ public final class Main {
         }
         if (command.equals("/trust")) {
             WorkspaceTrust.Status status = trust.check(root);
-            if (status.trusted()) {
+            if (status.fullyTrusted()) {
                 trusted = true;
+                buildTrusted = true;
                 ui.progress(status.state() == WorkspaceTrust.State.NOTHING
-                    ? "В проекте нет памяти, навыков или скриптов проверки, которым нужно доверие."
-                    : "Память, навыки и скрипты проверки проекта одобрены и не менялись.");
+                    ? "В проекте нет памяти, навыков, скриптов проверки или файлов сборки, которым нужно доверие."
+                    : "Память, навыки, скрипты проверки и файлы сборки проекта одобрены и не менялись.");
                 return true;
             }
             ensureTrust();
@@ -154,9 +172,11 @@ public final class Main {
         }
         if (command.equals("/trust revoke")) {
             trust.revoke(root);
-            trusted = trust.check(root).trusted();
+            WorkspaceTrust.Status revoked = trust.check(root);
+            trusted = revoked.trusted();
+            buildTrusted = revoked.buildTrusted();
             reloadProjectContext();
-            ui.progress(trusted ? "Доверять нечему: в проекте нет таких файлов."
+            ui.progress(trusted && buildTrusted ? "Доверять нечему: в проекте нет таких файлов."
                 : "Доверие отозвано: память и навыки проекта выгружены, проверки запускаются только с подтверждением.");
             return true;
         }
@@ -266,7 +286,8 @@ public final class Main {
             messages = new ArrayList<>();
             updateSystem();
             save();
-            ui.progress("Новая сессия " + session.get("id"));
+            ui.progress("Начат новый разговор.");
+            ui.detail("Сессия " + session.get("id"));
             return true;
         }
         if (command.startsWith("/resume ")) {
@@ -282,16 +303,19 @@ public final class Main {
             messages = objectList(session.get("messages"));
             updateSystem();
             save();
-            ui.progress("Продолжаю сессию " + id);
+            ui.progress("Продолжаю разговор " + id + ".");
             return true;
         }
         return false;
     }
 
-    private void ask(String prompt) throws Exception {
+    private void ask(String typed) throws Exception {
+        // Слова, набранные латиницей в русской раскладке, переводятся; пользователь видит, как понят запрос.
+        String prompt = KeyboardLayout.fix(typed);
+        if (!prompt.equals(typed)) ui.step("Часть текста набрана в английской раскладке — понял так: «" + prompt + "»");
         if (StyleScan.isStyleQuestion(prompt) && !ChangeNudge.isChangeRequest(prompt)) {
             // Оформление по всему проекту приложение проверяет само: быстро, по всем файлам и без окна контекста модели.
-            String report = StyleScan.report(root);
+            String report = StyleScan.report(root, ui.verbose());
             messages.add(Map.of("role", "user", "content", prompt));
             messages.add(Map.of("role", "assistant", "content", report));
             save();
@@ -324,7 +348,7 @@ public final class Main {
                     String nudge = ChangeNudge.message(prompt, turnTools.report(), turnTools.policy());
                     if (nudge != null) {
                         ui.stopThinking();
-                        System.err.println("◇ Kuleshato: модель описала исправление, но не внесла его — напоминаю один раз");
+                        ui.step("Модель только описала исправление — прошу её внести его");
                     }
                     return nudge;
                 });
@@ -338,6 +362,8 @@ public final class Main {
             ui.stopThinking();
             ui.answer(result);
             if (tools != null && !tools.report().isEmpty()) ui.progress(tools.report().render());
+            String unverified = tools == null ? null : tools.report().unverifiedWarning(ChangeNudge.isChangeRequest(prompt));
+            if (unverified != null) ui.warning(unverified);
             if (tools != null) refreshOwnWrites(tools.report());
             handleLessons(prompt, lessons.proposed(), tools == null ? null : tools.report());
         } catch (Exception error) {
@@ -399,26 +425,40 @@ public final class Main {
     private void ensureTrust() throws IOException {
         WorkspaceTrust.Status status = trust.check(root);
         trusted = status.trusted();
-        if (trusted) return;
-        System.err.println(WorkspaceTrust.describe(status));
+        buildTrusted = status.buildTrusted();
+        if (trusted && buildTrusted) return;
+        System.err.println(WorkspaceTrust.describe(status, ui.verbose()));
+        // Новичку имя файла сборки ничего не говорит: показываем, что из него выполнится.
+        String build = BuildSummary.summarize(root, status.changes().stream().map(WorkspaceTrust.Change::path).toList());
+        if (!build.isEmpty()) System.err.println(build);
+        if (status.state() == WorkspaceTrust.State.CHANGED) {
+            // Что именно изменилось с одобрения — без этого «доверять?» превращается в угадывание.
+            for (WorkspaceTrust.Change change : status.changes().stream().limit(5).toList()) {
+                String diff = trust.diff(root, change);
+                if (diff != null) ui.showDiff(diff);
+            }
+        }
         if (System.console() == null) {
-            System.err.println("Без интерактивного терминала эти файлы не загружаются; запустите Kuleshato интерактивно и выполните /trust.");
+            System.err.println("Без интерактивного терминала это не одобряется; запустите Kuleshato интерактивно и выполните /trust.");
             return;
         }
         if (confirm(WorkspaceTrust.question(status))) {
             trust.approve(root);
             trusted = true;
-            ui.progress("Файлы одобрены. Если они изменятся, Kuleshato спросит снова.");
-        } else {
+            buildTrusted = true;
+            ui.progress("Одобрено. Если эти файлы изменятся, Kuleshato спросит снова.");
+        } else if (!trusted) {
             ui.progress("Память и навыки проекта не загружены, проверки запускаются только с подтверждением. Одобрить позже: /trust.");
+        } else {
+            ui.progress("Хорошо: проверки будут запускаться только с вашего подтверждения. Одобрить позже: /trust.");
         }
     }
 
     /** Если одобренные файлы изменились во время работы, доверие снимается и Kuleshato спрашивает снова. */
     private void recheckTrust() throws IOException {
-        if (!trusted || trust.check(root).trusted()) return;
+        if (!(trusted && buildTrusted) || trust.check(root).fullyTrusted()) return;
         ensureTrust();
-        if (!trusted) reloadProjectContext();
+        reloadProjectContext();
     }
 
     private void loadProjectContext() throws IOException {
@@ -440,7 +480,7 @@ public final class Main {
 
     /** Подтверждённые пользователем правки в .kuleshato/ и скриптах проверки не требуют повторного одобрения. */
     private void refreshOwnWrites(WorkspaceTools.TurnReport report) throws IOException {
-        if (!trusted) return;
+        if (!trusted || !buildTrusted) return;
         for (String file : report.changedFiles) {
             if (WorkspaceTrust.isTracked(file)) trust.refresh(root, file);
         }
@@ -598,24 +638,34 @@ public final class Main {
         if (!placement.partlyOnCpu() || placementWarned) return;
         placementWarned = true;
         if (midRequest) ui.stopThinking();
-        ui.warning(placementWarning(placement, settings.contextWindow(), interactive));
+        ui.warning(placementWarning(settings.contextWindow(), interactive, !midRequest));
+        ui.detail(placementDetails(placement, settings.contextWindow()));
     }
 
-    static String placementWarning(ModelBackend.Placement placement, int contextWindow, boolean interactive) {
+    /**
+     * Простыми словами: что происходит и что делать. Текст зависит от того, можно ли спросить пользователя
+     * (интерактивный режим) и от момента — при запуске предложение следует сразу, во время ответа — после него.
+     */
+    static String placementWarning(int contextWindow, boolean interactive, boolean atStart) {
         int smaller = ProjectConfig.smallerContextWindow(contextWindow);
+        String text = "Kuleshato будет отвечать медленно: модель не помещается в память видеокарты, и часть работы идёт на процессоре.";
+        if (smaller == 0) {
+            return text + " Ускорить может модель поменьше (параметр --model) или закрытие программ, которые занимают видеокарту.";
+        }
+        if (!interactive) return text + " Чтобы ускорить, добавьте в .kuleshato/config.json строку \"contextWindow\": " + smaller + ".";
+        return text + (atStart ? " Это можно исправить — спрошу ниже." : " Как ускорить, предложу после ответа.");
+    }
+
+    static String placementDetails(ModelBackend.Placement placement, int contextWindow) {
         int window = placement.contextTokens() > 0 ? placement.contextTokens() : contextWindow;
-        return "Модель " + placement.model() + " не поместилась в видеопамять: " + placement.cpuPercent()
-            + "% работает на CPU (окно контекста " + window + "). Ответы будут в разы медленнее. "
-            + (smaller > 0 && interactive ? "Помогает меньшее окно контекста — предложу contextWindow " + smaller + " после этого ответа."
-                : smaller > 0 ? "Помогает меньшее окно контекста: укажите \"contextWindow\": " + smaller + " в .kuleshato/config.json."
-                : "Попробуйте модель меньше (--model) или закройте программы, которые занимают видеопамять.");
+        return placement.model() + ": " + placement.cpuPercent() + "% на CPU, окно контекста " + window + " токенов";
     }
 
     private String timeoutAdvice() {
         if (lastPlacement != null && lastPlacement.partlyOnCpu()) {
-            return "Причина, скорее всего, в том, что модель на " + lastPlacement.cpuPercent() + "% работает на CPU.";
+            return "Похоже, модель работает слишком медленно: она не помещается в память видеокарты.";
         }
-        return "Если это повторяется, уменьшите contextWindow в .kuleshato/config.json или выберите модель меньше (--model).";
+        return "Если это повторяется, попробуйте модель поменьше (параметр --model).";
     }
 
     /** Модель уже загружена и не помещается в видеопамять с текущим окном — сказать до первого запроса. */
@@ -643,9 +693,10 @@ public final class Main {
         Path path = ProjectConfig.safePath(root, ProjectConfig.RELATIVE_PATH);
         String current = java.nio.file.Files.exists(path) ? java.nio.file.Files.readString(path) : null;
         String updated = ProjectConfig.withContextWindow(current, smaller);
-        ui.showDiff(WorkspaceTools.formatDiff(".kuleshato/config.json", current == null ? "" : current, updated));
-        if (!confirm("Уменьшить окно контекста до " + smaller + ", чтобы модель поместилась в видеопамять? [y/N] ")) {
-            ui.progress("Настройки не изменены. Окно можно поменять позже в .kuleshato/config.json (/settings reload).");
+        if (ui.verbose()) ui.showDiff(WorkspaceTools.formatDiff(".kuleshato/config.json", current == null ? "" : current, updated));
+        if (!confirm("Ускорить? Kuleshato будет помнить меньше из длинного разговора (старое сжимается раньше), зато модель "
+            + "поместится в видеокарту. Настройка сохранится в .kuleshato/config.json. [y/N] ")) {
+            ui.progress("Хорошо, оставляю как есть. Изменить это можно позже в .kuleshato/config.json.");
             return;
         }
         ProjectConfig.write(root, current, updated);
@@ -653,8 +704,8 @@ public final class Main {
         reloadSettings();
         lastPlacement = null;
         placementWarned = false;
-        ui.progress("Окно контекста: " + smaller + ". Ollama перезагрузит модель при следующем запросе; "
-            + "проверить можно командой `ollama ps` — в колонке PROCESSOR должно быть 100% GPU.");
+        ui.progress("Готово: дальше ответы будут быстрее. Первый ответ займёт чуть больше времени — модель перезапустится.");
+        ui.detail("contextWindow: " + smaller + "; проверить: `ollama ps` — в колонке PROCESSOR должно быть 100% GPU");
     }
 
     private WorkspaceTools tools() throws IOException {
@@ -666,7 +717,8 @@ public final class Main {
 
             @Override
             public void autoRun(String command, String reason) {
-                ui.progress("Запускаю проверку без подтверждения: " + command + " — " + reason);
+                ui.progress("Запускаю проверку: " + command);
+                ui.detail("без подтверждения: " + reason);
             }
         };
         return new WorkspaceTools(root, commands, (path, diff) -> {
@@ -681,27 +733,46 @@ public final class Main {
 
     static final java.util.Set<String> MUTATING_TOOLS = java.util.Set.of("write_file", "edit_file", "run_command");
 
+    /** Шаг работы простыми словами; {@code null} — шаг покажет сам инструмент (команда спрашивает подтверждение). */
+    static String describeTool(String name, Map<String, Object> arguments) {
+        String path = arguments.get("path") instanceof String text && !text.isBlank() && !text.equals(".") ? text : null;
+        String file = path == null ? null : path.replace('\\', '/').replaceAll(".*/", "");
+        return switch (name) {
+            case "list_files" -> "Смотрю, какие файлы есть" + (path == null ? " в проекте" : " в " + path);
+            case "read_file" -> file == null ? "Читаю файл" : "Читаю " + file;
+            case "search_files" -> "Ищу «" + arguments.getOrDefault("query", "") + "»" + (path == null ? "" : " в " + path);
+            case "write_file", "edit_file" -> file == null ? "Готовлю изменение" : "Готовлю изменение в " + file;
+            case "run_command" -> null;
+            default -> name;
+        };
+    }
+
     private ModelClient.Events events(boolean[] toolCompleted) {
         return new ModelClient.Events() {
             @Override public void assistantText(String text) {}
-            @Override public void toolCall(String name) {
+            @Override public void toolCall(String name, Map<String, Object> arguments) {
                 ui.stopThinking();
-                System.err.println("◇ Kuleshato: " + name);
+                String step = describeTool(name, arguments);
+                if (step != null) ui.step(step);
+                ui.detail("инструмент " + name + " " + Json.stringify(arguments));
             }
             @Override public void toolResult(String name, String result) {
-                if (result.startsWith("Tool error:")) System.err.println("! Не удалось: " + name);
-                else if (result.contains("not approved by the user")) System.err.println("− Отменено: " + name);
-                else {
+                if (result.startsWith("Tool error:")) {
+                    ui.step("Не получилось — модель попробует иначе");
+                    ui.detail(result.lines().findFirst().orElse(result));
+                } else if (result.contains("not approved by the user")) {
+                    ui.step("Не применено: вы отказались");
+                } else {
                     // Предупреждать о повторе стоит только после действий с последствиями, а не после чтения файлов.
                     if (toolCompleted != null && MUTATING_TOOLS.contains(name)) toolCompleted[0] = true;
-                    System.err.println("✓ Готово: " + name);
+                    ui.detail("✓ " + name);
                 }
             }
             @Override public void status(String status) {
                 if (status.equals("thinking-cut")) {
                     ui.stopThinking();
-                    System.err.println("◇ Kuleshato: рассуждение превысило " + ModelClient.TOOL_THINKING_BUDGET
-                        + " токенов — прошу модель сразу сделать следующий шаг");
+                    ui.step("Модель слишком долго раздумывает — прошу её сразу перейти к делу");
+                    ui.detail("рассуждение превысило " + ModelClient.TOOL_THINKING_BUDGET + " токенов; шаг повторён без Thinking");
                 }
                 ui.thinking(status);
             }
@@ -735,7 +806,7 @@ public final class Main {
 
     /** Скрипты проверки из неодобренной папки не запускаются автоматически, даже если это разрешает настройка. */
     private boolean autoRunChecks() {
-        return autoRunChecks(settings.autoRunChecks(), trusted);
+        return autoRunChecks(settings.autoRunChecks(), trusted && buildTrusted);
     }
 
     static boolean autoRunChecks(boolean setting, boolean trusted) {
@@ -926,6 +997,7 @@ public final class Main {
             String arg = args[i];
             switch (arg) {
                 case "--help", "-h" -> options.help = true;
+                case "--verbose" -> options.verbose = true;
                 case "--version", "-v" -> options.version = true;
                 case "--cwd", "--model", "--ollama-url", "--resume" -> {
                     if (++i >= args.length) throw new IOException(arg + " requires a value");
@@ -949,6 +1021,75 @@ public final class Main {
         return options;
     }
 
+    /**
+     * {@code /help} внутри разговора: что умеет Kuleshato — обычными словами и с примерами просьб, затем навыки
+     * и остальные команды. Параметры запуска — в {@code kuleshato --help} ({@link #printHelp()}).
+     */
+    static String replHelp(List<SkillRegistry.Skill> skills, List<String> enabled) {
+        StringBuilder text = new StringBuilder("\nЧто умеет Kuleshato — просто напишите, что нужно:\n\n");
+        String[][] abilities = {
+            {"Рассказать о проекте", "«Что это за приложение?», «Где обрабатываются заказы?»"},
+            {"Найти и исправить ошибку", "«Тест CalcTest падает — почини»"},
+            {"", "Изменения показываются до записи, проверка запускается сама."},
+            {"Проверить оформление", "«Проверь код на единый стиль»"},
+            {"Объяснить код", "«Что делает метод placeOrder?», «Зачем здесь @Transactional?»"},
+            {"Запомнить правило", "после ошибки Kuleshato сам предложит урок на будущее"},
+        };
+        for (String[] ability : abilities) {
+            text.append("  ").append(String.format(java.util.Locale.ROOT, "%-26s", ability[0])).append(ability[1]).append('\n');
+        }
+        if (!skills.isEmpty()) {
+            text.append("\nНавыки — дополнительные режимы (включить: /skill enable <имя>, выключить: /skill disable <имя>):\n");
+            int width = skills.stream().mapToInt(skill -> skill.name().length()).max().orElse(0) + 2;
+            for (SkillRegistry.Skill skill : skills) {
+                text.append("  ").append(String.format(java.util.Locale.ROOT, "%-" + width + "s", skill.name()))
+                    .append(skill.description()).append(enabled.contains(skill.name()) ? " (включён)" : "").append('\n');
+            }
+        }
+        for (String[] group : COMMAND_HELP) {
+            if (group.length == 1) {
+                text.append('\n').append(group[0]).append('\n');
+                continue;
+            }
+            text.append("  ").append(String.format(java.util.Locale.ROOT, "%-26s", group[0])).append(group[1]).append('\n');
+        }
+        return text.append('\n').toString();
+    }
+
+    /** Команды по группам: строка из одного элемента — заголовок группы, из двух — команда и что она делает. */
+    private static final String[][] COMMAND_HELP = {
+        {"Команды — разобраться в проекте:"},
+        {"/brief [папка]", "коротко о проекте: версия Java, Maven или Gradle, тесты, CI"},
+        {"/review <файл>", "проверить файл или папку на ошибки и риски"},
+        {"/review Класс#метод", "проверить один метод, например /review OrderService#placeOrder"},
+        {"/review diff", "проверить ваши изменения, которые ещё не закоммичены"},
+        {"Команды — спланировать работу:"},
+        {"/plan <цель>", "составить пошаговый план, например /plan Добавить валидацию запросов"},
+        {"/plan", "показать текущий план"},
+        {"/plan done [номер]", "отметить шаг выполненным (без номера — следующий)"},
+        {"/plan clear", "удалить план"},
+        {"Команды — разговор:"},
+        {"/new", "начать новый разговор; прошлый сохранится"},
+        {"/sessions", "список прошлых разговоров в этом проекте"},
+        {"/resume <ID>", "вернуться к прошлому разговору (ID — из /sessions)"},
+        {"/clear", "забыть текущий разговор и начать с чистого листа; файлы проекта не меняются"},
+        {"/compact", "сжать длинный разговор, чтобы Kuleshato не терял нить и отвечал быстрее"},
+        {"Команды — память и навыки:"},
+        {"/memory", "показать, что Kuleshato помнит об этом проекте"},
+        {"/memory init", "создать файл памяти, чтобы записать правила проекта"},
+        {"/memory reload", "перечитать память, если вы поправили её вручную"},
+        {"/skills", "список навыков с примерами"},
+        {"/skill enable <имя>", "включить навык, /skill disable <имя> — выключить"},
+        {"Команды — настройки:"},
+        {"/settings", "показать настройки: какая модель выбрана и где она работает"},
+        {"/settings init", "создать файл настроек проекта, чтобы поменять модель или скорость"},
+        {"/trust", "посмотреть и одобрить файлы проекта, которые влияют на Kuleshato"},
+        {"/trust revoke", "отозвать одобрение"},
+        {"/details", "показывать или скрывать технические подробности"},
+        {"/help", "эта справка"},
+        {"/exit", "выйти"},
+    };
+
     private static void printHelp() {
         System.out.println("""
             Kuleshato — локальный Java-помощник для разработки
@@ -961,27 +1102,18 @@ public final class Main {
               --ollama-url <url>  Loopback URL Ollama
               --cwd <каталог>     Java-проект (по умолчанию: текущий каталог)
               --resume <ID>       Возобновить сессию
+              --verbose           Показывать технические подробности
               -h, --help          Показать справку
               -v, --version       Показать версию
 
-            Допускаются только каталоги с Java-исходниками или конфигурацией Java-сборки.
-            В интерактивном режиме: /help, /clear, /compact, /memory, /settings,
-            /trust, /skills, /brief [путь], /review <файл|Класс#метод|diff>, /plan [цель],
-            /sessions, /new, /resume <ID>, /exit.
-
-            Примеры:
-              /brief src
-              /review src/main/java/app/OrderService.java
-              /review OrderService#placeOrder
-              /review diff
-              /plan Добавить валидацию REST-запросов
-              /skill enable remember
-              Попросить: «Предложи, что из этого обсуждения сохранить в памяти»
+            Запускайте Kuleshato из папки Java-проекта.
+            Внутри разговора введите /help — там описано, что умеет Kuleshato и что делает каждая команда.
             """);
     }
 
     private static final class Options {
         private boolean help;
+        private boolean verbose;
         private boolean version;
         private String cwd;
         private String model;

@@ -476,8 +476,11 @@ final class ProjectInspection {
             List<String> selectedLines = new ArrayList<>();
             List<Integer> lineNumbers = new ArrayList<>();
             for (int lineIndex : selection.selected()) {
-                numbered.append(String.format(Locale.ROOT, "[E%05d] %4d: %s%n",
-                    nextEvidenceId++, lineIndex + 1, selection.lines()[lineIndex]));
+                String text = selection.lines()[lineIndex];
+                // Комментарий «метод проверен, ошибок нет» — заявление автора; для модели он помечен, в цитатах его нет.
+                boolean claim = selection.path().endsWith(".java") && CodeReview.reassurance(text);
+                numbered.append(String.format(Locale.ROOT, "[E%05d] %4d: %s%s%n",
+                    nextEvidenceId++, lineIndex + 1, text, claim ? CodeReview.REASSURANCE_NOTE : ""));
                 selectedLines.add(selection.lines()[lineIndex]);
                 lineNumbers.add(lineIndex + 1);
             }

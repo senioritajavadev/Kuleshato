@@ -22,9 +22,25 @@ final class TerminalUI {
     };
 
     private final boolean color;
+    /** Подробный режим ({@code --verbose}, {@code /details}): технические детали для тех, кому они нужны. */
+    private boolean verbose;
 
     TerminalUI(boolean color) {
         this.color = color && System.getenv("NO_COLOR") == null && !"dumb".equals(System.getenv("TERM"));
+    }
+
+    boolean verbose() { return verbose; }
+
+    void verbose(boolean value) { verbose = value; }
+
+    /** Техническая подробность: печатается только в подробном режиме. */
+    void detail(String content) {
+        if (verbose) System.err.println("    " + dim("· " + content));
+    }
+
+    /** Шаг работы простыми словами: «Читаю Main.java». */
+    void step(String content) {
+        System.err.println("  " + dim("· " + content));
     }
 
     void welcome(String model, String workspace, List<Map<String, Object>> skills, List<String> enabled) {
@@ -39,7 +55,7 @@ final class TerminalUI {
         line("  " + bold(rgb(103, 239, 218, "KULESHATO")) + "  " + rgb(176, 105, 235, "Java · локальный помощник для разработки"));
         line("  " + dim("Модель: " + model));
         line("  " + dim(workspace));
-        line("  " + dim("Java-режим: активен · /help — команды · /exit — выход"));
+        line("  " + dim("/help — что умеет Kuleshato · /exit — выход"));
         line("  " + dim("Навыки: " + (enabled.isEmpty() ? "не включены" : "включены " + String.join(", ", enabled))
             + " · доступно " + skills.size() + " — /skills"));
     }
@@ -89,15 +105,18 @@ final class TerminalUI {
         if (!color) return;
         String time = String.format(java.util.Locale.ROOT, "%d:%02d", elapsed.toMinutes(), elapsed.toSecondsPart());
         String stage = switch (phase) {
-            case PROMPT -> "читает запрос";
-            case THINKING -> "рассуждает · " + thinkingTokens + " ток.";
-            case ANSWER -> "отвечает · " + answerTokens + " ток." + (thinkingTokens > 0 ? " (рассуждение " + thinkingTokens + ")" : "");
+            case PROMPT -> "читает вопрос";
+            case THINKING -> "думает";
+            case ANSWER -> "пишет ответ";
         };
-        long seconds = Math.max(1, elapsed.toSeconds());
-        int tokens = thinkingTokens + answerTokens;
-        String speed = tokens > 0 && phase != ModelBackend.Phase.PROMPT
-            ? String.format(java.util.Locale.ROOT, " · ~%.1f ток/с", (double) tokens / seconds) : "";
-        System.err.print("\r\u001b[2K" + dim("Kuleshato " + stage + " · " + time + speed + " · Ctrl+C — прервать"));
+        String details = "";
+        if (verbose) {
+            long seconds = Math.max(1, elapsed.toSeconds());
+            int tokens = thinkingTokens + answerTokens;
+            details = " · рассуждение " + thinkingTokens + " ток., ответ " + answerTokens + " ток."
+                + (tokens > 0 ? String.format(java.util.Locale.ROOT, " · ~%.1f ток/с", (double) tokens / seconds) : "");
+        }
+        System.err.print("\r\u001b[2K" + dim("Kuleshato " + stage + "… " + time + details));
     }
 
     void warning(String content) { System.err.println("  " + yellow("!") + " " + content); }
@@ -113,6 +132,12 @@ final class TerminalUI {
     }
 
     void projectEvidence(ProjectInspection.Inspection inspection) {
+        if (!verbose) {
+            int count = inspection.filesRead().size();
+            step(count == 0 ? "Подходящих файлов в проекте не нашлось" : "Посмотрел " + StyleScan.plural(count, "файл", "файла", "файлов")
+                + " проекта" + (inspection.truncated() ? " (большие — частично)" : ""));
+            return;
+        }
         line("\nПроверка проекта приложением:");
         List<String> files = inspection.filesRead();
         if (files.isEmpty()) line("  Исходники и конфигурационные файлы для чтения не найдены.");
@@ -126,9 +151,16 @@ final class TerminalUI {
         if (inspection.truncated()) line("  Контекст ограничен; часть файлов могла быть пропущена или сокращена.");
     }
 
+    private static final java.util.regex.Pattern HUNK = java.util.regex.Pattern.compile("^@@ \\d+ -\\d+ \\+\\d+ @@$");
+
     void showDiff(String diff) {
-        line("\n" + yellow("Изменения:"));
-        for (String line : diff.split("\n")) {
+        String[] lines = diff.split("\n");
+        boolean headers = lines.length >= 2 && lines[0].startsWith("--- a/") && lines[1].startsWith("+++ b/");
+        if (verbose || !headers) line("\n" + yellow("Изменения:"));
+        else line("\n" + yellow("Изменения в " + lines[1].substring(6) + ":"));
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i];
+            if (!verbose && (headers && i < 2 || HUNK.matcher(line).matches())) continue;
             if (line.startsWith("+")) System.out.println(green(line));
             else if (line.startsWith("-")) System.out.println(red(line));
             else System.out.println(dim(line));
