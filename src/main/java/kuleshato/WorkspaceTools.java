@@ -35,6 +35,8 @@ final class WorkspaceTools {
         boolean checkLimitReached;
         boolean lastCheckPassed;
         boolean checkRun;
+        /** Последняя упавшая проверка с кодом завершения — доказательство ошибки для урока. */
+        String lastFailedCheck;
 
         boolean isEmpty() {
             return changedFiles.isEmpty() && declinedFiles.isEmpty() && declinedCommands.isEmpty() && commands.isEmpty();
@@ -242,6 +244,11 @@ final class WorkspaceTools {
     private String writeFile(String relative, String content) throws IOException {
         if (content.getBytes(StandardCharsets.UTF_8).length > MAX_BYTES) throw new IOException("Содержимое превышает лимит 256 КБ.");
         Path target = resolve(relative);
+        if (isProjectMemory(target)) {
+            throw new IOException("Память проекта (.kuleshato/memory.md) нельзя менять через write_file/edit_file: "
+                + "урок записывается только через строку [[LESSON краткое правило]] в конце ответа, с доказательством ошибки "
+                + "и подтверждением пользователя. Do not retry this edit.");
+        }
         Path parent = target.getParent().toRealPath();
         inside(parent);
         if (!Files.isDirectory(parent)) throw new IOException("Родительский путь не является каталогом.");
@@ -395,6 +402,7 @@ final class WorkspaceTools {
                 report.checkRun = true;
                 report.lastCheckPassed = false;
                 report.failedChecks++;
+                report.lastFailedCheck = "`" + command + "` не завершилась";
             }
             throw error;
         }
@@ -403,7 +411,10 @@ final class WorkspaceTools {
         if (check) {
             report.checkRun = true;
             report.lastCheckPassed = result.exitCode() == 0;
-            if (result.exitCode() != 0) report.failedChecks++;
+            if (result.exitCode() != 0) {
+                report.failedChecks++;
+                report.lastFailedCheck = "`" + command + "` упала (код " + result.exitCode() + ")";
+            }
         }
         String output = boundForModel(result.output());
         if (result.exitCode() != 0) {
@@ -535,6 +546,17 @@ final class WorkspaceTools {
         return "Путь " + relative.replace('\\', '/') + " не существует. Ближайший существующий каталог — " + where + ": "
             + (entries.isEmpty() ? "(пусто)" : String.join(", ", entries))
             + ". Чтобы найти файл по имени или содержимому во всём проекте, вызови search_files без path.";
+    }
+
+    /** Путь указывает на память проекта (с учётом регистра в Windows и символических ссылок каталога). */
+    private boolean isProjectMemory(Path target) throws IOException {
+        Path memory = root.resolve(ProjectMemory.RELATIVE_PATH);
+        if (target.toString().equalsIgnoreCase(memory.toString())) return true;
+        Path parent = target.getParent();
+        if (parent == null || !Files.exists(parent)) return false;
+        Path real = parent.toRealPath().resolve(target.getFileName());
+        Path memoryParent = memory.getParent();
+        return Files.exists(memoryParent) && real.toString().equalsIgnoreCase(memoryParent.toRealPath().resolve("memory.md").toString());
     }
 
     private Path resolve(String relative) throws IOException {

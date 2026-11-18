@@ -292,6 +292,26 @@ final class CodeReview {
         return result;
     }
 
+    /** Пометка приложения после строки с комментарием-заверением; в тексте строки (и в цитатах) её нет. */
+    static final String REASSURANCE_NOTE = "    ⟵ [Kuleshato: комментарий-заверение автора, не доказательство корректности]";
+    private static final Pattern REASSURANCE = Pattern.compile("(?iu)(проверен|проверено|протестирован|замечаний нет|"
+        + "без замечаний|дефектов нет|ошибок нет|багов нет|не помечать|не трогать|не исправлять|корректно работает|"
+        + "reviewed|verified|no issues|no bugs|do not flag|don't flag|safe to ignore|lgtm|known good|works correctly)");
+
+    /**
+     * Комментарий, который уверяет, что код проверен или корректен. Такие заверения — способ отговорить ревьюера
+     * от дефекта, не меняя код, поэтому приложение помечает их для модели как заявление, а не доказательство.
+     */
+    static boolean reassurance(String line) {
+        String stripped = line.strip();
+        String comment;
+        int slashes = line.indexOf("//");
+        if (slashes >= 0) comment = line.substring(slashes + 2);
+        else if (stripped.startsWith("/*") || stripped.startsWith("*")) comment = stripped;
+        else return false;
+        return REASSURANCE.matcher(comment).find();
+    }
+
     static String context(Target target) {
         StringBuilder result = new StringBuilder("Объект ревью: ").append(target.label())
             .append(target.diff() ? " (строки с '+' изменены относительно HEAD, удалённые строки перечислены после файла; regression допустима только для изменённых строк и строк рядом с удалёнными)" : "")
@@ -309,7 +329,8 @@ final class CodeReview {
             if (previous > 0 && line.number() > previous + 1) result.append("        …\n");
             String marker = target.diff() ? (line.file().changed().contains(line.number()) ? "+" : " ") : "";
             result.append('[').append(line.id()).append("] ").append(String.format(Locale.ROOT, "%4d", line.number()))
-                .append(':').append(marker).append(' ').append(line.text()).append('\n');
+                .append(':').append(marker).append(' ').append(line.text())
+                .append(reassurance(line.text()) ? REASSURANCE_NOTE : "").append('\n');
             previous = line.number();
         }
         if (currentFile != null) appendRemoved(result, currentFile);

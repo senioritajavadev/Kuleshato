@@ -59,7 +59,7 @@ final class CommandPolicy {
 
     Verdict judge(String command) {
         String normalized = normalize(command);
-        if (!autoRun) return new Verdict(Decision.ASK_USER, "автозапуск проверок выключен настройкой autoRunChecks");
+        if (!autoRun) return new Verdict(Decision.ASK_USER, "автозапуск проверок выключен (настройка autoRunChecks или папка проекта не одобрена — /trust)");
         if (SHELL_METACHARACTERS.matcher(command).find()) {
             return new Verdict(Decision.ASK_USER, "команда содержит символы составления shell-команд");
         }

@@ -51,7 +51,9 @@ final class TerminalUI {
         line("\nДоступные навыки:");
         for (Map<String, Object> skill : skills) {
             String name = String.valueOf(skill.get("name"));
-            line("  " + name + " — " + skill.get("description"));
+            Object source = skill.get("source");
+            line("  " + name + " — " + skill.get("description")
+                + (source == null || SkillRegistry.BUILTIN.equals(source) ? "" : " [" + source + "]"));
             line("    Пример: " + skillExample(name));
             line("    " + (enabled.contains(name) ? "Уже включён" : "Включить: /skill enable " + name));
         }

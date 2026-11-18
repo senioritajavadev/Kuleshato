@@ -25,12 +25,18 @@ final class SkillRegistry {
     private SkillRegistry() {}
 
     static Catalog discover(Path workspace) throws IOException {
+        return discover(workspace, Path.of(System.getProperty("user.home")), true);
+    }
+
+    /**
+     * Встроенные навыки регистрируются первыми: их имена зарезервированы. Навык пользователя или проекта с занятым
+     * именем не заменяет встроенный, а загружается под именем с префиксом источника ({@code project:java-notes}) —
+     * так чужой файл из репозитория не становится инструкцией, включённой по умолчанию. Навыки проекта загружаются,
+     * только если пользователь доверяет папке ({@link WorkspaceTrust}).
+     */
+    static Catalog discover(Path workspace, Path home, boolean includeProject) throws IOException {
         Map<String, Skill> byName = new LinkedHashMap<>();
         List<String> warnings = new ArrayList<>();
-        Path home = Path.of(System.getProperty("user.home"));
-        loadDirectory(workspace.resolve(".kuleshato/skills"), "проектный", workspace, byName, warnings);
-        loadDirectory(home.resolve(".kuleshato/skills"), "пользовательский", null, byName, warnings);
-        loadDirectory(home.resolve("skills"), "пользовательский", null, byName, warnings);
         for (String name : BUILTIN_NAMES) {
             String resource = "/skills/" + name + "/SKILL.md";
             try (InputStream stream = SkillRegistry.class.getResourceAsStream(resource)) {
@@ -38,14 +44,25 @@ final class SkillRegistry {
                     warnings.add("Не найден встроенный навык " + name + ".");
                     continue;
                 }
-                Skill skill = parse(stream.readAllBytes(), "встроенный", null, resource);
+                Skill skill = parse(stream.readAllBytes(), BUILTIN, null, resource);
                 add(skill, byName, warnings);
             }
         }
+        loadDirectory(home.resolve(".kuleshato/skills"), USER, null, byName, warnings);
+        loadDirectory(home.resolve("skills"), USER, null, byName, warnings);
+        if (includeProject) loadDirectory(workspace.resolve(".kuleshato/skills"), PROJECT, workspace, byName, warnings);
         List<Skill> result = new ArrayList<>(byName.values());
         result.sort(Comparator.comparing(Skill::name));
         if (result.size() > 100) result = result.subList(0, 100);
         return new Catalog(List.copyOf(result), List.copyOf(warnings));
+    }
+
+    static final String BUILTIN = "встроенный";
+    static final String USER = "пользовательский";
+    static final String PROJECT = "проектный";
+
+    static boolean isBuiltinName(String name) {
+        return BUILTIN_NAMES.contains(name);
     }
 
     private static void loadDirectory(Path root, String source, Path boundary,
@@ -76,10 +93,20 @@ final class SkillRegistry {
     }
 
     private static void add(Skill skill, Map<String, Skill> byName, List<String> warnings) {
-        if (byName.containsKey(skill.name())) {
+        if (!byName.containsKey(skill.name())) {
+            byName.put(skill.name(), skill);
+            return;
+        }
+        String prefix = skill.source().equals(PROJECT) ? "project:" : skill.source().equals(USER) ? "user:" : null;
+        String renamed = prefix == null ? null : prefix + skill.name();
+        if (renamed == null || byName.containsKey(renamed)) {
             warnings.add("Навык " + skill.name() + " из источника «" + skill.source()
-                + "» пропущен: имя уже занято источником с более высоким приоритетом.");
-        } else byName.put(skill.name(), skill);
+                + "» пропущен: имя уже занято.");
+            return;
+        }
+        byName.put(renamed, new Skill(renamed, skill.description(), skill.source(), skill.directory(), skill.instructions()));
+        warnings.add("Навык " + skill.name() + " (" + skill.source() + ") не заменяет " + byName.get(skill.name()).source()
+            + " навык с тем же именем и загружен как " + renamed + "; включить его можно только явно: /skill enable " + renamed + ".");
     }
 
     private static Skill parse(byte[] bytes, String source, Path root, String path) {

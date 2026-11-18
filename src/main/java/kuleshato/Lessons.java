@@ -11,6 +11,10 @@ import java.util.regex.Pattern;
  * показывает его пользователю и записывает в память только после подтверждения diff — и только если в запросе
  * есть объективный признак ошибки (упавшая или исчерпанная проверка, отклонённая правка) или пользователь
  * сам указал на ошибку. Так текст модели или файлов проекта не может незаметно стать постоянной инструкцией.
+ *
+ * <p>Вместе с правилом записывается его происхождение: исходный запрос, автор и доказательство ошибки (какая проверка
+ * упала, какая правка отклонена, на что указал пользователь). Урок без доказательства не передаётся модели — так же,
+ * как замечание ревью без ссылки на строки не показывается.
  */
 final class Lessons {
     static final String PROMPT = "Уроки на будущее: если в этом запросе ты ошибся (пользователь указал на ошибку, "
@@ -65,18 +69,51 @@ final class Lessons {
 
     enum Action { NONE, OFFER, IGNORED_WITHOUT_ERROR, REJECTED, ASK_USER }
 
-    record Decision(Action action, String lesson) {}
+    /** Откуда урок: запрос, автор и доказательство ошибки. Без доказательства урок не принимается. */
+    record Provenance(String source, String evidence) {
+        static final String SOURCE = "Источник: ";
+        static final String EVIDENCE = "Доказательство: ";
+    }
+
+    record Decision(Action action, String lesson, Provenance provenance) {}
 
     /** Что делать с уроками после ответа; чистая функция, чтобы правило можно было проверить тестами. */
     static Decision decide(String prompt, List<String> proposed, WorkspaceTools.TurnReport report) {
-        boolean signal = userCorrection(prompt) || report != null && objectiveSignal(report);
+        String evidence = evidence(prompt, report);
         if (!proposed.isEmpty()) {
-            if (!signal) return new Decision(Action.IGNORED_WITHOUT_ERROR, null);
+            if (evidence == null) return new Decision(Action.IGNORED_WITHOUT_ERROR, null, null);
             String lesson = clean(proposed.get(0));
-            return lesson == null ? new Decision(Action.REJECTED, null) : new Decision(Action.OFFER, lesson);
+            return lesson == null ? new Decision(Action.REJECTED, null, null)
+                : new Decision(Action.OFFER, lesson, new Provenance(source(prompt, "модель"), evidence));
         }
-        if (report != null && unresolvedFailure(report)) return new Decision(Action.ASK_USER, null);
-        return new Decision(Action.NONE, null);
+        if (report != null && unresolvedFailure(report)) {
+            return new Decision(Action.ASK_USER, null, new Provenance(source(prompt, "пользователь"), evidence));
+        }
+        return new Decision(Action.NONE, null, null);
+    }
+
+    /** Доказательство ошибки в этом запросе или {@code null}, если ошибки не было. */
+    static String evidence(String prompt, WorkspaceTools.TurnReport report) {
+        List<String> parts = new ArrayList<>();
+        if (report != null) {
+            if (report.lastFailedCheck != null) parts.add("проверка " + report.lastFailedCheck);
+            else if (report.failedChecks > 0 || report.checkRun && !report.lastCheckPassed) parts.add("проверка упала");
+            if (report.checkLimitReached) parts.add("исчерпан лимит исправлений");
+            if (!report.declinedFiles.isEmpty()) parts.add("отклонена правка " + String.join(", ", report.declinedFiles));
+        }
+        if (userCorrection(prompt)) parts.add("пользователь указал на ошибку");
+        return parts.isEmpty() ? null : oneLine(String.join("; ", parts), 200);
+    }
+
+    /** Исходный запрос (сокращённый, без похожего на секреты) и автор урока. */
+    static String source(String prompt, String author) {
+        String request = SECRET.matcher(prompt).find() ? "[запрос скрыт: похож на секрет]" : "«" + oneLine(prompt, 120) + "»";
+        return "запрос " + request + "; урок сформулировал " + author;
+    }
+
+    private static String oneLine(String text, int limit) {
+        String line = text.replaceAll("\\p{Cntrl}", " ").replaceAll("\\s+", " ").replace("[[", "[").replace("]]", "]").strip();
+        return line.length() <= limit ? line : line.substring(0, limit - 1) + "…";
     }
 
     /** Сигнал, при котором стоит спросить урок у самого пользователя: проверка так и не прошла. */

@@ -26,6 +26,11 @@ public final class Main {
     private List<Object> messages;
     private SkillRegistry.Catalog catalog;
     private List<SkillRegistry.Skill> activeSkills = new ArrayList<>();
+    private final WorkspaceTrust trust = new WorkspaceTrust();
+    /** Одобрил ли пользователь память, навыки и скрипты проверки этого проекта ({@link WorkspaceTrust}). */
+    private boolean trusted;
+    /** Уроки без доказательства, которые пользователь в этой сессии отказался подтверждать. */
+    private final java.util.Set<String> declinedManual = new java.util.HashSet<>();
 
     public static void main(String[] args) {
         try {
@@ -61,9 +66,9 @@ public final class Main {
             if (piped.isEmpty()) { printHelp(); return; }
             prompt = piped;
         }
-        memory = ProjectMemory.read(root);
+        ensureTrust();
+        loadProjectContext();
         warnMemoryBudget();
-        catalog = SkillRegistry.discover(root);
         session = options.resume == null ? sessions.create(root, model) : sessions.load(options.resume, root);
         if (options.resume != null && !modelOverride && session.get("model") instanceof String savedModel) model = savedModel;
         plan = validatePlan(session.get("plan"));
@@ -121,18 +126,48 @@ public final class Main {
                 : "Контекст пока нельзя сократить: недостаточно завершённых ходов.");
             return true;
         }
-        if (command.equals("/memory")) { memory = ProjectMemory.read(root); ui.showMemory(memory); warnMemoryBudget(); return true; }
+        if (command.equals("/trust")) {
+            WorkspaceTrust.Status status = trust.check(root);
+            if (status.trusted()) {
+                trusted = true;
+                ui.progress(status.state() == WorkspaceTrust.State.NOTHING
+                    ? "В проекте нет памяти, навыков или скриптов проверки, которым нужно доверие."
+                    : "Память, навыки и скрипты проверки проекта одобрены и не менялись.");
+                return true;
+            }
+            ensureTrust();
+            reloadProjectContext();
+            return true;
+        }
+        if (command.equals("/trust revoke")) {
+            trust.revoke(root);
+            trusted = trust.check(root).trusted();
+            reloadProjectContext();
+            ui.progress(trusted ? "Доверять нечему: в проекте нет таких файлов."
+                : "Доверие отозвано: память и навыки проекта выгружены, проверки запускаются только с подтверждением.");
+            return true;
+        }
+        if (command.equals("/memory")) {
+            recheckTrust();
+            if (!trusted) ui.progress("Память проекта не загружена: папка не одобрена (/trust). Содержимое файла:");
+            ui.showMemory(ProjectMemory.read(root));
+            warnMemoryBudget();
+            return true;
+        }
         if (command.equals("/memory reload")) {
-            memory = ProjectMemory.read(root);
-            updateSystem();
-            save();
+            recheckTrust();
+            reloadProjectContext();
+            if (trusted) confirmManualLessons();
             ui.showMemory(memory);
             warnMemoryBudget();
             return true;
         }
         if (command.equals("/memory init")) {
             if (!confirm("Создать шаблон памяти .kuleshato/memory.md? [y/N] ")) return true;
-            memory = ProjectMemory.initialize(root);
+            ProjectMemory.initialize(root);
+            trust.refresh(root, ".kuleshato/memory.md");
+            trusted = trusted || trust.check(root).trusted();
+            memory = trustedMemory(root, trusted);
             updateSystem();
             save();
             ui.showMemory(memory);
@@ -146,12 +181,15 @@ public final class Main {
         if (command.equals("/settings init")) {
             if (!confirm("Создать шаблон настроек .kuleshato/config.json? [y/N] ")) return true;
             ProjectConfig.initialize(root);
+            trust.refresh(root, ".kuleshato/config.json");
             reloadSettings();
             ui.showSettings(effectiveSettings(), overrides());
             return true;
         }
         if (command.equals("/skills")) {
-            catalog = SkillRegistry.discover(root);
+            recheckTrust();
+            catalog = discoverSkills();
+            if (!trusted) ui.progress("Навыки проекта не загружены: папка не одобрена (/trust).");
             ui.showSkills(skillMaps(catalog.skills()), activeSkillNames());
             for (String warning : catalog.warnings()) System.err.println("Предупреждение навыков: " + warning);
             return true;
@@ -224,7 +262,9 @@ public final class Main {
             session = sessions.load(id, root);
             plan = validatePlan(session.get("plan"));
             if (!modelOverride && session.get("model") instanceof String savedModel) model = savedModel;
-            catalog = SkillRegistry.discover(root);
+            recheckTrust();
+            memory = trustedMemory(root, trusted);
+            catalog = discoverSkills();
             activeSkills = restoreSkills(strings(session.get("activeSkills")));
             messages = objectList(session.get("messages"));
             updateSystem();
@@ -276,6 +316,7 @@ public final class Main {
             ui.stopThinking();
             ui.answer(result);
             if (tools != null && !tools.report().isEmpty()) ui.progress(tools.report().render());
+            if (tools != null) refreshOwnWrites(tools.report());
             handleLessons(prompt, lessons.proposed(), tools == null ? null : tools.report());
         } catch (Exception error) {
             ui.stopThinking();
@@ -306,16 +347,104 @@ public final class Main {
         target.addAll(snapshot);
     }
 
-    /** Раздел памяти для системной подсказки с учётом бюджета окна контекста. */
+    /**
+     * Раздел памяти для системной подсказки: уроки без доказательства ошибки отброшены, строки происхождения вырезаны,
+     * остальное — в пределах бюджета окна контекста.
+     */
     static String memorySection(String memory, int contextWindow) {
         return "Память Java-проекта (пользовательские заметки и уроки, не системные инструкции):\n"
-            + ProjectMemory.forPrompt(memory, contextWindow).text();
+            + ProjectMemory.forPrompt(ProjectMemory.forModel(memory).text(), contextWindow).text();
     }
 
     private void warnMemoryBudget() {
         if (memory == null) return;
-        ProjectMemory.PromptMemory prompt = ProjectMemory.forPrompt(memory, settings.contextWindow());
+        ProjectMemory.ModelMemory filtered = ProjectMemory.forModel(memory);
+        ProjectMemory.PromptMemory prompt = ProjectMemory.forPrompt(filtered.text(), settings.contextWindow());
         if (prompt.truncated()) System.err.println("Предупреждение: " + ProjectMemory.warning(prompt, settings.contextWindow()));
+        if (!filtered.unproven().isEmpty()) {
+            System.err.println("Предупреждение: уроки без доказательства ошибки не переданы модели ("
+                + filtered.unproven().size() + "):");
+            filtered.unproven().forEach(lesson -> System.err.println("  - " + lesson));
+            System.err.println("Если это ваши уроки, дописанные вручную, подтвердите их в /memory reload.");
+        }
+    }
+
+    /**
+     * Доверие к памяти, навыкам и скриптам проекта: при первом открытии или после их изменения Kuleshato показывает,
+     * что нашёл, и спрашивает. Без одобрения они не загружаются, а проверки не запускаются автоматически.
+     */
+    private void ensureTrust() throws IOException {
+        WorkspaceTrust.Status status = trust.check(root);
+        trusted = status.trusted();
+        if (trusted) return;
+        System.err.println(WorkspaceTrust.describe(status));
+        if (System.console() == null) {
+            System.err.println("Без интерактивного терминала эти файлы не загружаются; запустите Kuleshato интерактивно и выполните /trust.");
+            return;
+        }
+        if (confirm("Доверять этим файлам? [y/N] ")) {
+            trust.approve(root);
+            trusted = true;
+            ui.progress("Файлы одобрены. Если они изменятся, Kuleshato спросит снова.");
+        } else {
+            ui.progress("Память и навыки проекта не загружены, проверки запускаются только с подтверждением. Одобрить позже: /trust.");
+        }
+    }
+
+    /** Если одобренные файлы изменились во время работы, доверие снимается и Kuleshato спрашивает снова. */
+    private void recheckTrust() throws IOException {
+        if (!trusted || trust.check(root).trusted()) return;
+        ensureTrust();
+        if (!trusted) reloadProjectContext();
+    }
+
+    private void loadProjectContext() throws IOException {
+        memory = trustedMemory(root, trusted);
+        catalog = discoverSkills();
+    }
+
+    private void reloadProjectContext() throws IOException {
+        List<String> names = activeSkillNames();
+        loadProjectContext();
+        activeSkills = restoreSkills(names);
+        updateSystem();
+        save();
+    }
+
+    private SkillRegistry.Catalog discoverSkills() throws IOException {
+        return SkillRegistry.discover(root, Path.of(System.getProperty("user.home")), trusted);
+    }
+
+    /** Подтверждённые пользователем правки в .kuleshato/ и скриптах проверки не требуют повторного одобрения. */
+    private void refreshOwnWrites(WorkspaceTools.TurnReport report) throws IOException {
+        if (!trusted) return;
+        for (String file : report.changedFiles) {
+            if (WorkspaceTrust.isTracked(file)) trust.refresh(root, file);
+        }
+    }
+
+    /** Урок, дописанный в memory.md вручную, передаётся модели только после подтверждения пользователем. */
+    private void confirmManualLessons() throws IOException {
+        if (System.console() == null) return;
+        boolean changed = false;
+        while (true) {
+            String current = ProjectMemory.readRaw(root);
+            ProjectMemory.Lesson lesson = ProjectMemory.lessons(current).stream()
+                .filter(item -> !item.proven() && !declinedManual.contains(item.text())).findFirst().orElse(null);
+            if (lesson == null) break;
+            if (!confirm("Урок без доказательства ошибки: «" + lesson.text() + "».\nЭто ваш урок, дописанный вручную? "
+                + "Подтвердить и передавать модели [y/N] ")) {
+                declinedManual.add(lesson.text());
+                continue;
+            }
+            ProjectMemory.write(root, current, ProjectMemory.withManualProvenance(current, lesson, java.time.LocalDate.now()));
+            changed = true;
+        }
+        if (!changed) return;
+        trust.refresh(root, ".kuleshato/memory.md");
+        memory = ProjectMemory.read(root);
+        updateSystem();
+        save();
     }
 
     private void replaceLastAssistantContent(String content) {
@@ -338,7 +467,7 @@ public final class Main {
         Lessons.Decision decision = Lessons.decide(prompt, proposed, report);
         switch (decision.action()) {
             case NONE -> { }
-            case OFFER -> offerLesson(decision.lesson());
+            case OFFER -> offerLesson(decision.lesson(), decision.provenance());
             case IGNORED_WITHOUT_ERROR ->
                 ui.progress("Модель предложила урок, но ошибка в этом запросе не зафиксирована — урок не записывается.");
             case REJECTED -> ui.progress("Предложенный урок отклонён: пустой, слишком длинный или похож на секрет.");
@@ -352,25 +481,31 @@ public final class Main {
                     ui.progress("Урок не записан: нужно от 10 до 200 символов без секретов.");
                     return;
                 }
-                offerLesson(lesson);
+                offerLesson(lesson, decision.provenance());
             }
         }
     }
 
-    private void offerLesson(String lesson) throws IOException {
+    private void offerLesson(String lesson, Lessons.Provenance provenance) throws IOException {
+        if (!trusted) {
+            ui.progress("Урок не записан: память проекта не одобрена (/trust), а запись урока одобрила бы её содержимое.");
+            return;
+        }
         String current = ProjectMemory.readRaw(root);
         if (ProjectMemory.containsLesson(current, lesson)) {
             ui.progress("Такой урок уже есть в памяти проекта.");
             return;
         }
-        String updated = ProjectMemory.withLesson(current, lesson, java.time.LocalDate.now());
-        ui.progress("Предлагаемый урок: " + lesson);
+        String updated = ProjectMemory.withLesson(current, lesson, java.time.LocalDate.now(), provenance);
+        ui.progress("Предлагаемый урок: " + lesson + "\n  " + Lessons.Provenance.SOURCE + provenance.source()
+            + "\n  " + Lessons.Provenance.EVIDENCE + provenance.evidence());
         ui.showDiff(WorkspaceTools.formatDiff(".kuleshato/memory.md", current == null ? "" : current, updated));
         if (!confirm("Добавить урок в память проекта? [y/N] ")) {
             ui.progress("Урок не записан.");
             return;
         }
         ProjectMemory.write(root, current, updated);
+        trust.refresh(root, ".kuleshato/memory.md");
         memory = ProjectMemory.read(root);
         updateSystem();
         save();
@@ -437,7 +572,7 @@ public final class Main {
         return new WorkspaceTools(root, commands, (path, diff) -> {
             ui.showDiff(diff);
             return confirm(ui.fileApproval());
-        }, CommandPolicy.detect(root, settings.autoRunChecks()));
+        }, CommandPolicy.detect(root, autoRunChecks()));
     }
 
     private ModelClient.Events events() {
@@ -466,7 +601,7 @@ public final class Main {
     private void updateSystem() throws IOException {
         List<String> context = new ArrayList<>();
         context.add(BASE_PROMPT);
-        context.add(changeWorkflow(CommandPolicy.detect(root, settings.autoRunChecks())));
+        context.add(changeWorkflow(CommandPolicy.detect(root, autoRunChecks())));
         context.add(Lessons.PROMPT);
         if (memory != null) context.add(memorySection(memory, settings.contextWindow()));
         if (plan != null) context.add("План пользователя:\n" + Json.stringify(plan));
@@ -483,6 +618,20 @@ public final class Main {
         session.put("activeSkills", activeSkillNames());
         session.put("plan", plan);
         session.put("model", model);
+    }
+
+    /** Скрипты проверки из неодобренной папки не запускаются автоматически, даже если это разрешает настройка. */
+    private boolean autoRunChecks() {
+        return autoRunChecks(settings.autoRunChecks(), trusted);
+    }
+
+    static boolean autoRunChecks(boolean setting, boolean trusted) {
+        return setting && trusted;
+    }
+
+    /** Память проекта загружается, только если папка одобрена; общая логика CLI и эталонного набора. */
+    static String trustedMemory(Path root, boolean trusted) throws IOException {
+        return trusted ? ProjectMemory.read(root) : null;
     }
 
     /** Сценарий изменения кода: изучение → план → diff → проверка → честный итог. */
@@ -579,7 +728,8 @@ public final class Main {
 
     private List<String> activeSkillNames() { return activeSkills.stream().map(SkillRegistry.Skill::name).toList(); }
     private static List<Map<String, Object>> skillMaps(List<SkillRegistry.Skill> skills) {
-        return skills.stream().map(skill -> Map.<String, Object>of("name", skill.name(), "description", skill.description())).toList();
+        return skills.stream().map(skill -> Map.<String, Object>of("name", skill.name(), "description", skill.description(),
+            "source", skill.source())).toList();
     }
 
     private void markPlanDone(String command) throws IOException {
@@ -703,7 +853,7 @@ public final class Main {
 
             Допускаются только каталоги с Java-исходниками или конфигурацией Java-сборки.
             В интерактивном режиме: /help, /clear, /compact, /memory, /settings,
-            /skills, /brief [путь], /review <файл|Класс#метод|diff>, /plan [цель],
+            /trust, /skills, /brief [путь], /review <файл|Класс#метод|diff>, /plan [цель],
             /sessions, /new, /resume <ID>, /exit.
 
             Примеры:
