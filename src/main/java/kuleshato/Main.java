@@ -31,6 +31,12 @@ public final class Main {
     private boolean trusted;
     /** Уроки без доказательства, которые пользователь в этой сессии отказался подтверждать. */
     private final java.util.Set<String> declinedManual = new java.util.HashSet<>();
+    /** Где Ollama загрузила модель — по последней проверке {@code /api/ps}. */
+    private ModelBackend.Placement lastPlacement;
+    private boolean placementWarned;
+    private boolean contextOffered;
+    /** Интерактивный режим (REPL), где можно предложить изменение настроек; в разовом запросе — только совет. */
+    private boolean interactive;
 
     public static void main(String[] args) {
         try {
@@ -87,6 +93,8 @@ public final class Main {
         ui.welcome(model, root.toString(), skillMaps(catalog.skills()), activeSkillNames());
         for (String warning : catalog.warnings()) System.err.println("Предупреждение навыков: " + warning);
         System.out.println(options.resume == null ? "Новая сессия " + session.get("id") : "Продолжаю сессию " + session.get("id"));
+        interactive = System.console() != null;
+        checkPlacementAtStart();
         repl();
     }
 
@@ -103,6 +111,11 @@ public final class Main {
                 ask(command);
             } catch (Exception error) {
                 ui.stopThinking();
+                ui.error(error.getMessage());
+            }
+            try {
+                offerSmallerContext();
+            } catch (Exception error) {
                 ui.error(error.getMessage());
             }
         }
@@ -276,6 +289,15 @@ public final class Main {
     }
 
     private void ask(String prompt) throws Exception {
+        if (StyleScan.isStyleQuestion(prompt) && !ChangeNudge.isChangeRequest(prompt)) {
+            // Оформление по всему проекту приложение проверяет само: быстро, по всем файлам и без окна контекста модели.
+            String report = StyleScan.report(root);
+            messages.add(Map.of("role", "user", "content", prompt));
+            messages.add(Map.of("role", "assistant", "content", report));
+            save();
+            ui.answer(report);
+            return;
+        }
         List<Object> previousMessages = snapshotMessages(messages);
         boolean[] toolCompleted = {false};
         ProjectInspection.Inspection inspection = null;
@@ -327,11 +349,12 @@ public final class Main {
             } catch (IOException saveError) {
                 error.addSuppressed(saveError);
             }
+            String reason = error.getMessage() + (error instanceof ModelBackend.TimeoutException ? " " + timeoutAdvice() : "");
             if (toolCompleted[0]) {
-                throw new IOException("Инструменты успели выполниться, но итоговый ответ модели не получен. "
-                    + "Перед повтором проверьте, не были ли выполнены действия, которые не следует повторять.\n"
-                    + error.getMessage(), error);
+                throw new IOException("Ответ модели не получен, но в этом ходе уже изменены файлы или запущены команды "
+                    + "(см. итог выше) — перед повтором проверьте их, чтобы не повторить.\n" + reason, error);
             }
+            if (error instanceof ModelBackend.TimeoutException) throw new IOException(reason, error);
             throw error;
         }
     }
@@ -382,7 +405,7 @@ public final class Main {
             System.err.println("Без интерактивного терминала эти файлы не загружаются; запустите Kuleshato интерактивно и выполните /trust.");
             return;
         }
-        if (confirm("Доверять этим файлам? [y/N] ")) {
+        if (confirm(WorkspaceTrust.question(status))) {
             trust.approve(root);
             trusted = true;
             ui.progress("Файлы одобрены. Если они изменятся, Kuleshato спросит снова.");
@@ -554,7 +577,84 @@ public final class Main {
     }
 
     private ModelClient client(WorkspaceTools tools) throws IOException {
-        return new ModelClient(ModelBackend.create(settings.backend(), ollamaUrl, model), settings.contextWindow(), tools);
+        ModelBackend backend = ModelBackend.create(settings.backend(), ollamaUrl, model);
+        backend.progress(new ModelBackend.Progress() {
+            @Override
+            public void update(ModelBackend.Phase phase, int thinkingTokens, int answerTokens, java.time.Duration elapsed) {
+                ui.generation(phase, thinkingTokens, answerTokens, elapsed);
+            }
+
+            @Override
+            public void placement(ModelBackend.Placement placement) {
+                notePlacement(placement, true);
+            }
+        });
+        return new ModelClient(backend, settings.contextWindow(), tools);
+    }
+
+    /** Запоминает, где загружена модель, и один раз за сессию предупреждает, если она частично на CPU. */
+    private void notePlacement(ModelBackend.Placement placement, boolean midRequest) {
+        lastPlacement = placement;
+        if (!placement.partlyOnCpu() || placementWarned) return;
+        placementWarned = true;
+        if (midRequest) ui.stopThinking();
+        ui.warning(placementWarning(placement, settings.contextWindow(), interactive));
+    }
+
+    static String placementWarning(ModelBackend.Placement placement, int contextWindow, boolean interactive) {
+        int smaller = ProjectConfig.smallerContextWindow(contextWindow);
+        int window = placement.contextTokens() > 0 ? placement.contextTokens() : contextWindow;
+        return "Модель " + placement.model() + " не поместилась в видеопамять: " + placement.cpuPercent()
+            + "% работает на CPU (окно контекста " + window + "). Ответы будут в разы медленнее. "
+            + (smaller > 0 && interactive ? "Помогает меньшее окно контекста — предложу contextWindow " + smaller + " после этого ответа."
+                : smaller > 0 ? "Помогает меньшее окно контекста: укажите \"contextWindow\": " + smaller + " в .kuleshato/config.json."
+                : "Попробуйте модель меньше (--model) или закройте программы, которые занимают видеопамять.");
+    }
+
+    private String timeoutAdvice() {
+        if (lastPlacement != null && lastPlacement.partlyOnCpu()) {
+            return "Причина, скорее всего, в том, что модель на " + lastPlacement.cpuPercent() + "% работает на CPU.";
+        }
+        return "Если это повторяется, уменьшите contextWindow в .kuleshato/config.json или выберите модель меньше (--model).";
+    }
+
+    /** Модель уже загружена и не помещается в видеопамять с текущим окном — сказать до первого запроса. */
+    private void checkPlacementAtStart() {
+        try {
+            ModelBackend.Placement placement = ModelBackend.create(settings.backend(), ollamaUrl, model).placement();
+            if (placement == null) return;
+            if (placement.contextTokens() > 0 && placement.contextTokens() != settings.contextWindow()) return;
+            notePlacement(placement, false);
+            offerSmallerContext();
+        } catch (Exception error) {
+            // Проверка необязательная: без неё Kuleshato узнает о размещении модели во время первого запроса.
+        }
+    }
+
+    /**
+     * Если модель частично на CPU, один раз за сессию предлагает уменьшить contextWindow: diff настроек и подтверждение.
+     * Ollama перезагрузит модель с новым окном при следующем запросе.
+     */
+    private void offerSmallerContext() throws IOException {
+        if (contextOffered || lastPlacement == null || !lastPlacement.partlyOnCpu() || System.console() == null) return;
+        contextOffered = true;
+        int smaller = ProjectConfig.smallerContextWindow(settings.contextWindow());
+        if (smaller == 0) return;
+        Path path = ProjectConfig.safePath(root, ProjectConfig.RELATIVE_PATH);
+        String current = java.nio.file.Files.exists(path) ? java.nio.file.Files.readString(path) : null;
+        String updated = ProjectConfig.withContextWindow(current, smaller);
+        ui.showDiff(WorkspaceTools.formatDiff(".kuleshato/config.json", current == null ? "" : current, updated));
+        if (!confirm("Уменьшить окно контекста до " + smaller + ", чтобы модель поместилась в видеопамять? [y/N] ")) {
+            ui.progress("Настройки не изменены. Окно можно поменять позже в .kuleshato/config.json (/settings reload).");
+            return;
+        }
+        ProjectConfig.write(root, current, updated);
+        if (trusted || current == null) trust.refresh(root, ".kuleshato/config.json");
+        reloadSettings();
+        lastPlacement = null;
+        placementWarned = false;
+        ui.progress("Окно контекста: " + smaller + ". Ollama перезагрузит модель при следующем запросе; "
+            + "проверить можно командой `ollama ps` — в колонке PROCESSOR должно быть 100% GPU.");
     }
 
     private WorkspaceTools tools() throws IOException {
@@ -579,19 +679,32 @@ public final class Main {
         return events(null);
     }
 
+    static final java.util.Set<String> MUTATING_TOOLS = java.util.Set.of("write_file", "edit_file", "run_command");
+
     private ModelClient.Events events(boolean[] toolCompleted) {
         return new ModelClient.Events() {
             @Override public void assistantText(String text) {}
-            @Override public void toolCall(String name) { System.err.println("◇ Kuleshato: " + name); }
+            @Override public void toolCall(String name) {
+                ui.stopThinking();
+                System.err.println("◇ Kuleshato: " + name);
+            }
             @Override public void toolResult(String name, String result) {
                 if (result.startsWith("Tool error:")) System.err.println("! Не удалось: " + name);
                 else if (result.contains("not approved by the user")) System.err.println("− Отменено: " + name);
                 else {
-                    if (toolCompleted != null) toolCompleted[0] = true;
+                    // Предупреждать о повторе стоит только после действий с последствиями, а не после чтения файлов.
+                    if (toolCompleted != null && MUTATING_TOOLS.contains(name)) toolCompleted[0] = true;
                     System.err.println("✓ Готово: " + name);
                 }
             }
-            @Override public void status(String status) { ui.thinking(status); }
+            @Override public void status(String status) {
+                if (status.equals("thinking-cut")) {
+                    ui.stopThinking();
+                    System.err.println("◇ Kuleshato: рассуждение превысило " + ModelClient.TOOL_THINKING_BUDGET
+                        + " токенов — прошу модель сразу сделать следующий шаг");
+                }
+                ui.thinking(status);
+            }
         };
     }
 

@@ -204,16 +204,36 @@ final class WorkspaceTrust {
 
     /** Текст запроса доверия: что найдено и что это меняет. */
     static String describe(Status status) {
+        boolean scriptsOnly = scriptsOnly(status);
         StringBuilder text = new StringBuilder(status.state() == State.CHANGED
             ? "Файлы, влияющие на поведение Kuleshato, изменились с момента одобрения:\n"
-            : "В проекте уже есть файлы, которые меняют поведение Kuleshato:\n");
+            : scriptsOnly
+                ? "В проекте есть скрипты проверки — после правок Kuleshato может запускать их без подтверждения:\n"
+                : "В проекте уже есть файлы, которые меняют поведение Kuleshato:\n");
         for (Change change : status.changes()) {
             text.append("  ").append(change.kind()).append(": ").append(change.path())
                 .append(change.size() >= 0 ? " (" + change.size() + " байт)" : "").append(" — ").append(purpose(change.path())).append('\n');
         }
-        text.append("Пока вы их не одобрите, память и навыки проекта не загружаются, а проверки не запускаются без подтверждения.\n")
-            .append("Одобряйте, только если просмотрели эти файлы и доверяете их автору.");
+        List<String> effects = new ArrayList<>();
+        if (status.changes().stream().anyMatch(change -> change.path().equals(".kuleshato/memory.md"))) effects.add("память проекта не загружается");
+        if (status.changes().stream().anyMatch(change -> change.path().startsWith(".kuleshato/skills/"))) effects.add("навыки проекта не загружаются");
+        if (status.changes().stream().anyMatch(change -> !change.path().startsWith(".kuleshato/"))) {
+            effects.add("скрипты проверки запускаются только с подтверждением");
+        }
+        if (!effects.isEmpty()) text.append("Без одобрения ").append(String.join(", ", effects)).append(".\n");
+        text.append(scriptsOnly
+            ? "Разрешайте, если это ваш проект или вы просмотрели скрипты."
+            : "Одобряйте, только если просмотрели эти файлы и доверяете их автору.");
         return text.toString();
+    }
+
+    /** Вопрос пользователю: при одних скриптах проверки речь об автозапуске, а не о «доверии к файлам». */
+    static String question(Status status) {
+        return scriptsOnly(status) ? "Разрешить автозапуск этих скриптов? [y/N] " : "Доверять этим файлам? [y/N] ";
+    }
+
+    private static boolean scriptsOnly(Status status) {
+        return status.changes().stream().noneMatch(change -> change.path().startsWith(".kuleshato/"));
     }
 
     private static String purpose(String path) {

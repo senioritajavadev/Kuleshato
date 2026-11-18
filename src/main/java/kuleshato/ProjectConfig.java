@@ -61,6 +61,48 @@ record ProjectConfig(
         }
     }
 
+    /**
+     * Текст настроек с новым {@code contextWindow}: в существующем файле меняется только это значение (формат и
+     * остальные ключи сохраняются), без файла — шаблон. Файл не меняется.
+     */
+    static String withContextWindow(String current, int contextWindow) {
+        if (current == null) {
+            return "{\n  \"model\": \"qwen3:8b\",\n  \"ollamaUrl\": \"http://127.0.0.1:11434\",\n"
+                + "  \"contextWindow\": " + contextWindow + ",\n  \"autoCompact\": true,\n  \"autoRunChecks\": true,\n"
+                + "  \"backend\": \"ollama\"\n}\n";
+        }
+        java.util.regex.Matcher existing = java.util.regex.Pattern.compile("(\"contextWindow\"\\s*:\\s*)\\d+").matcher(current);
+        if (existing.find()) return current.substring(0, existing.start(1)) + existing.group(1) + contextWindow + current.substring(existing.end());
+        int brace = current.indexOf('{');
+        if (brace < 0) return current;
+        String rest = current.substring(brace + 1);
+        boolean empty = rest.strip().startsWith("}");
+        return current.substring(0, brace + 1) + "\n  \"contextWindow\": " + contextWindow + (empty ? "" : ",") + rest;
+    }
+
+    /** Записывает настройки, только если файл не изменился с момента чтения и новый текст корректен. */
+    static void write(Path root, String expected, String content) throws IOException {
+        Path path = safePath(root, RELATIVE_PATH);
+        String actual = Files.exists(path) ? Files.readString(path) : null;
+        if (!java.util.Objects.equals(actual, expected)) throw new IOException("Файл настроек изменился во время подтверждения; он не записан.");
+        Files.createDirectories(path.getParent());
+        Files.writeString(path, content);
+        try {
+            load(root);
+        } catch (IOException invalid) {
+            if (expected == null) Files.deleteIfExists(path);
+            else Files.writeString(path, expected);
+            throw new IOException("Новые настройки некорректны; файл восстановлен: " + invalid.getMessage(), invalid);
+        }
+    }
+
+    /** Окно контекста меньше текущего, при котором модель вероятнее поместится в видеопамять, или 0, если меньше некуда. */
+    static int smallerContextWindow(int current) {
+        if (current > 8192) return 8192;
+        if (current > 4096) return 4096;
+        return 0;
+    }
+
     static Path safePath(Path root, Path relative) throws IOException {
         Path workspace = root.toRealPath();
         Path target = workspace.resolve(relative).normalize();

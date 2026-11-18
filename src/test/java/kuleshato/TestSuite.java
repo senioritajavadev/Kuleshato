@@ -69,6 +69,12 @@ public final class TestSuite {
         test("folder trust gates project memory, skills and check scripts", TestSuite::workspaceTrust);
         test("project skills cannot take built-in skill names", TestSuite::reservedSkillNames);
         test("review marks reassurance comments as claims, not evidence", TestSuite::reviewReassurance);
+        test("Ollama answers stream with progress, tool calls and usage", TestSuite::ollamaStreaming);
+        test("long thinking in the tool loop is cut and retried without it", TestSuite::thinkingBudget);
+        test("a silent Ollama stream stops quickly instead of waiting the full limit", TestSuite::silentStreamStops);
+        test("a model partly on CPU is detected and a smaller context is suggested", TestSuite::modelPlacement);
+        test("style questions get a deterministic whole-project report", TestSuite::styleScan);
+        test("trust prompt names only what was actually found", TestSuite::trustWording);
         System.out.println("Passed " + passed + " Java tests.");
     }
 
@@ -1685,6 +1691,248 @@ public final class TestSuite {
             deleteTree(root);
             deleteTree(home);
         }
+    }
+
+    /** Сервер Ollama для тестов потоковой передачи: /api/chat отдаёт строки NDJSON с паузами, /api/ps — размещение. */
+    private static com.sun.net.httpserver.HttpServer streamingServer(List<String> chunks, long pauseMillis, String ps,
+                                                                    List<String> bodies) throws Exception {
+        com.sun.net.httpserver.HttpServer server =
+            com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
+        server.createContext("/api/chat", exchange -> {
+            bodies.add(new String(exchange.getRequestBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
+            exchange.sendResponseHeaders(200, 0);
+            try (var output = exchange.getResponseBody()) {
+                for (String chunk : chunks) {
+                    if (chunk.equals("<<pause>>")) {
+                        Thread.sleep(pauseMillis);
+                        continue;
+                    }
+                    output.write((chunk + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    output.flush();
+                }
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+            } catch (java.io.IOException closedByClient) {
+                // Клиент прервал поток — так и должно быть в тестах тайм-аута и бюджета.
+            }
+        });
+        server.createContext("/api/ps", exchange -> {
+            byte[] bytes = ps.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (var output = exchange.getResponseBody()) { output.write(bytes); }
+        });
+        server.start();
+        return server;
+    }
+
+    private static String url(com.sun.net.httpserver.HttpServer server) {
+        return "http://127.0.0.1:" + server.getAddress().getPort();
+    }
+
+    private static void ollamaStreaming() throws Exception {
+        List<String> bodies = new java.util.concurrent.CopyOnWriteArrayList<>();
+        List<String> chunks = List.of(
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"thinking\":\"Нужно \"},\"done\":false}",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"thinking\":\"посмотреть файлы\"},\"done\":false}",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"Смотрю \"},\"done\":false}",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"проект\",\"tool_calls\":[{\"function\":{\"name\":\"list_files\",\"arguments\":{\"path\":\".\"}}}]},\"done\":false}",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"prompt_eval_count\":120,\"eval_count\":4,\"eval_duration\":2000000000}");
+        com.sun.net.httpserver.HttpServer server = streamingServer(chunks, 0, "{\"models\":[]}", bodies);
+        try {
+            OllamaBackend backend = new OllamaBackend(url(server), "qwen3:8b");
+            List<ModelBackend.Phase> phases = new java.util.concurrent.CopyOnWriteArrayList<>();
+            backend.progress(new ModelBackend.Progress() {
+                @Override public void update(ModelBackend.Phase phase, int thinking, int answer, java.time.Duration elapsed) {
+                    phases.add(phase);
+                }
+            });
+            Map<String, Object> message = backend.complete(new ModelBackend.Request(List.of(Map.of("role", "user", "content", "hi")),
+                null, false, true, 4096, 100, 0.1, java.time.Duration.ofSeconds(30)));
+            check(bodies.get(0).contains("\"stream\":true"));
+            check(message.get("content").equals("Смотрю проект"));
+            check(message.get("thinking").equals("Нужно посмотреть файлы"));
+            check(message.get("tool_calls") instanceof List<?> calls && calls.size() == 1);
+            check(message.get("role").equals("assistant"));
+            check(backend.usage().promptTokens() == 120 && backend.usage().outputTokens() == 4);
+            check(backend.usage().tokensPerSecond() == 2.0);
+            check(phases.get(phases.size() - 1) == ModelBackend.Phase.ANSWER);
+        } finally { server.stop(0); }
+
+        // Ошибка, присланная в потоке, не превращается в пустой ответ.
+        com.sun.net.httpserver.HttpServer failing = streamingServer(List.of("{\"error\":\"model not found\"}"), 0, "{}", bodies);
+        try {
+            boolean reported = false;
+            try {
+                new OllamaBackend(url(failing), "nope").complete(new ModelBackend.Request(List.of(), null, false, false,
+                    4096, 10, 0.1, java.time.Duration.ofSeconds(10)));
+            } catch (java.io.IOException expected) { reported = expected.getMessage().contains("model not found"); }
+            check(reported);
+        } finally { failing.stop(0); }
+    }
+
+    private static void thinkingBudget() throws Exception {
+        List<String> bodies = new java.util.concurrent.CopyOnWriteArrayList<>();
+        com.sun.net.httpserver.HttpServer server =
+            com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
+        server.createContext("/api/chat", exchange -> {
+            String body = new String(exchange.getRequestBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            bodies.add(body);
+            exchange.sendResponseHeaders(200, 0);
+            try (var output = exchange.getResponseBody()) {
+                if (body.contains("\"think\":true")) {
+                    for (int i = 0; i < ModelClient.TOOL_THINKING_BUDGET + 50; i++) {
+                        output.write("{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"thinking\":\"хм \"},\"done\":false}\n"
+                            .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    }
+                    output.write("{\"message\":{\"role\":\"assistant\",\"content\":\"поздно\"},\"done\":true}\n"
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                } else {
+                    output.write("{\"message\":{\"role\":\"assistant\",\"content\":\"Готово без рассуждения\"},\"done\":true}\n"
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                }
+            } catch (java.io.IOException closedByClient) {
+                // Клиент прервал рассуждение по бюджету.
+            }
+        });
+        server.start();
+        Path root = Files.createTempDirectory("kuleshato-budget-");
+        try {
+            WorkspaceTools tools = new WorkspaceTools(root, command -> false, (path, diff) -> false);
+            List<String> statuses = new java.util.ArrayList<>();
+            String answer = new ModelClient(url(server), "qwen3:8b", 4096, tools).chat(
+                new java.util.ArrayList<>(List.of(Map.of("role", "user", "content", "Что в проекте?"))), false,
+                new ModelClient.Events() { @Override public void status(String status) { statuses.add(status); } });
+            check(answer.equals("Готово без рассуждения"));
+            check(bodies.size() == 2 && bodies.get(0).contains("\"think\":true") && bodies.get(1).contains("\"think\":false"));
+            check(statuses.contains("thinking-cut"));
+        } finally {
+            server.stop(0);
+            deleteTree(root);
+        }
+    }
+
+    private static void silentStreamStops() throws Exception {
+        List<String> bodies = new java.util.concurrent.CopyOnWriteArrayList<>();
+        com.sun.net.httpserver.HttpServer server = streamingServer(List.of(
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"thinking\":\"начинаю\"},\"done\":false}", "<<pause>>",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"поздно\"},\"done\":true}"), 6_000, "{}", bodies);
+        try {
+            OllamaBackend backend = new OllamaBackend(url(server), "qwen3:8b")
+                .withTimings(java.time.Duration.ofMillis(1500), java.time.Duration.ofMinutes(5));
+            long started = System.nanoTime();
+            boolean stopped = false;
+            try {
+                backend.complete(new ModelBackend.Request(List.of(), null, false, true, 4096, 10, 0.1, java.time.Duration.ofMinutes(10)));
+            } catch (ModelBackend.TimeoutException expected) {
+                stopped = expected.getMessage().contains("тишина");
+            }
+            check(stopped);
+            check(System.nanoTime() - started < 5_000_000_000L);
+        } finally { server.stop(0); }
+    }
+
+    private static void modelPlacement() throws Exception {
+        String ps = "{\"models\":[{\"name\":\"qwen3:8b\",\"model\":\"qwen3:8b\",\"size\":11000000000,"
+            + "\"size_vram\":5940000000,\"context_length\":40960}]}";
+        ModelBackend.Placement placement = OllamaBackend.placement(ps, "qwen3:8b");
+        check(placement != null && placement.partlyOnCpu() && placement.cpuPercent() == 46 && placement.contextTokens() == 40960);
+        check(!OllamaBackend.placement("{\"models\":[{\"name\":\"qwen3:8b\",\"size\":100,\"size_vram\":100}]}", "qwen3:8b").partlyOnCpu());
+        check(OllamaBackend.placement("{\"models\":[{\"name\":\"llama3:8b\",\"size\":100,\"size_vram\":10}]}", "qwen3:8b") == null);
+        check(OllamaBackend.placement("{\"models\":[{\"name\":\"tiny:latest\",\"size\":100,\"size_vram\":100}]}", "tiny") != null);
+        check(OllamaBackend.placement("not json", "qwen3:8b") == null);
+        String warning = Main.placementWarning(placement, 40960, true);
+        check(warning.contains("46% работает на CPU") && warning.contains("40960") && warning.contains("contextWindow 8192"));
+        String oneShot = Main.placementWarning(placement, 40960, false);
+        check(oneShot.contains("\"contextWindow\": 8192") && !oneShot.contains("предложу"));
+        check(ProjectConfig.smallerContextWindow(40960) == 8192 && ProjectConfig.smallerContextWindow(8192) == 4096
+            && ProjectConfig.smallerContextWindow(4096) == 0);
+
+        // Во время запроса наблюдатель узнаёт о размещении модели, не дожидаясь ответа.
+        List<String> bodies = new java.util.concurrent.CopyOnWriteArrayList<>();
+        com.sun.net.httpserver.HttpServer server = streamingServer(List.of("<<pause>>",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"done\":true}"), 1_500, ps, bodies);
+        try {
+            OllamaBackend backend = new OllamaBackend(url(server), "qwen3:8b")
+                .withTimings(java.time.Duration.ofMinutes(1), java.time.Duration.ZERO);
+            List<ModelBackend.Placement> seen = new java.util.concurrent.CopyOnWriteArrayList<>();
+            backend.progress(new ModelBackend.Progress() {
+                @Override public void placement(ModelBackend.Placement value) { seen.add(value); }
+            });
+            backend.complete(new ModelBackend.Request(List.of(), null, false, false, 40960, 10, 0.1, java.time.Duration.ofMinutes(1)));
+            check(seen.size() == 1 && seen.get(0).cpuPercent() == 46);
+        } finally { server.stop(0); }
+
+        // Меняется только contextWindow; формат и прочие ключи сохраняются; некорректный результат откатывается.
+        String config = "{\n  \"model\": \"qwen3:8b\",\n    \"contextWindow\" : 40960,\n  \"autoCompact\": false\n}\n";
+        check(ProjectConfig.withContextWindow(config, 8192).equals(config.replace("40960", "8192")));
+        check(ProjectConfig.withContextWindow("{\"model\": \"qwen3:8b\"}", 8192).equals("{\n  \"contextWindow\": 8192,\"model\": \"qwen3:8b\"}"));
+        check(ProjectConfig.withContextWindow("{}", 8192).equals("{\n  \"contextWindow\": 8192}"));
+        Path root = Files.createTempDirectory("kuleshato-config-window-");
+        try {
+            ProjectConfig.write(root, null, ProjectConfig.withContextWindow(null, 8192));
+            check(ProjectConfig.load(root).contextWindow() == 8192);
+            String current = Files.readString(root.resolve(".kuleshato/config.json"));
+            boolean restored = false;
+            try { ProjectConfig.write(root, current, ProjectConfig.withContextWindow(current, 100)); }
+            catch (java.io.IOException expected) { restored = expected.getMessage().contains("восстановлен"); }
+            check(restored && ProjectConfig.load(root).contextWindow() == 8192);
+            boolean conflict = false;
+            try { ProjectConfig.write(root, "{}", current); }
+            catch (java.io.IOException expected) { conflict = expected.getMessage().contains("изменился"); }
+            check(conflict);
+        } finally { deleteTree(root); }
+    }
+
+    private static void styleScan() throws Exception {
+        check(StyleScan.isStyleQuestion("привет, проверь код текущего проекта на консистентность и единый стиль"));
+        check(StyleScan.isStyleQuestion("Check the code style"));
+        check(!StyleScan.isStyleQuestion("Что делает OrderService?"));
+        check(!StyleScan.isStyleQuestion("/review src"));
+        Path root = Files.createTempDirectory("kuleshato-style-");
+        try {
+            write(root, "src/main/java/app/A.java", "package app;\n\nimport java.util.*;\n\npublic class A {\n    void a() {\n        int x = 1;   \n    }\n}\n");
+            write(root, "src/main/java/app/B.java", "package app;\n\npublic class B {\n    void b() {\n        int y = 2;\n    }\n}\n");
+            write(root, "src/main/java/app/C.java", "package app;\r\n\r\npublic class C\r\n{\r\n\tvoid c()\r\n\t{\r\n\t}\r\n}");
+            write(root, "target/generated/D.java", "class D {\n\t   \n}\n");
+            String report = StyleScan.report(root);
+            check(report.contains("проверено файлов — 3"));
+            check(report.contains("Отступы: пробелы по 4 — 2 файла"));
+            check(report.contains("отклонение: табуляция — 1 файл: src/main/java/app/C.java"));
+            check(report.contains("Переводы строк: LF — 2 файла"));
+            check(report.contains("отклонение: CRLF — 1 файл: src/main/java/app/C.java"));
+            check(report.contains("Открывающая фигурная скобка: на той же строке — 2 файла"));
+            check(report.contains("Пробелы в конце строк: 1 файл — src/main/java/app/A.java:7"));
+            check(report.contains("Импорты со *: 1 файл — src/main/java/app/A.java:3"));
+            check(report.contains("Нет перевода строки в конце файла: 1 файл — src/main/java/app/C.java"));
+            check(report.contains("BOM в начале файла: нет ✓"));
+            check(report.contains("/review"));
+            check(!report.contains("target/"));
+
+            write(root, ".editorconfig", "root = true\n\n[*.java]\nindent_style = tab\nmax_line_length = 40\n\n[*.md]\nindent_size = 2\n");
+            String declared = StyleScan.report(root);
+            check(declared.contains("Отступы: табуляция — 1 файл (объявлено в .editorconfig)"));
+            check(declared.contains("отклонение: пробелы по 4 — 2 файла"));
+            check(declared.contains("Строки длиннее 40 символов"));
+            check(StyleScan.editorConfig(root).equals(Map.of("indent_style", "tab", "max_line_length", "40")));
+        } finally { deleteTree(root); }
+    }
+
+    private static void trustWording() {
+        WorkspaceTrust.Status scripts = new WorkspaceTrust.Status(WorkspaceTrust.State.NEW, List.of(
+            new WorkspaceTrust.Change("build.ps1", "новый", 1320), new WorkspaceTrust.Change("test.ps1", "новый", 1793)));
+        String text = WorkspaceTrust.describe(scripts);
+        check(text.contains("скрипты проверки"));
+        check(!text.contains("память") && !text.contains("навык"));
+        check(WorkspaceTrust.question(scripts).contains("автозапуск"));
+        WorkspaceTrust.Status memory = new WorkspaceTrust.Status(WorkspaceTrust.State.NEW, List.of(
+            new WorkspaceTrust.Change(".kuleshato/memory.md", "новый", 10)));
+        String memoryText = WorkspaceTrust.describe(memory);
+        check(memoryText.contains("память проекта не загружается") && !memoryText.contains("навыки проекта не загружаются")
+            && !memoryText.contains("скрипты проверки запускаются"));
+        check(WorkspaceTrust.question(memory).contains("Доверять"));
+        check(Main.MUTATING_TOOLS.contains("write_file") && !Main.MUTATING_TOOLS.contains("list_files"));
     }
 
     /** Комментарии-заверения в ревью помечаются как заявление автора, а не доказательство. */

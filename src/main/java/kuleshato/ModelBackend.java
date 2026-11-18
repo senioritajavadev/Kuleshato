@@ -17,8 +17,18 @@ interface ModelBackend {
     /** Параметры одного запроса; {@code tools} может быть {@code null}, если инструменты не нужны. */
     record Request(
         List<Object> messages, List<Object> tools, boolean json, boolean think,
-        int contextTokens, int maxTokens, double temperature, Duration timeout
-    ) {}
+        int contextTokens, int maxTokens, double temperature, Duration timeout, int thinkingBudget
+    ) {
+        /** Запрос без бюджета рассуждения (0 — рассуждение не ограничено ничем, кроме {@code maxTokens}). */
+        Request(List<Object> messages, List<Object> tools, boolean json, boolean think,
+                int contextTokens, int maxTokens, double temperature, Duration timeout) {
+            this(messages, tools, json, think, contextTokens, maxTokens, temperature, timeout, 0);
+        }
+
+        Request withoutThinking() {
+            return new Request(messages, tools, json, false, contextTokens, maxTokens, temperature, timeout, 0);
+        }
+    }
 
     /** Модель не ответила за отведённое время; вызывающий код может показать детерминированный резервный ответ. */
     final class TimeoutException extends IOException {
@@ -27,6 +37,45 @@ interface ModelBackend {
         TimeoutException(String message, Throwable cause) {
             super(message, cause);
         }
+    }
+
+    /** Рассуждение превысило {@link Request#thinkingBudget()}; запрос прерван, его можно повторить без Thinking. */
+    final class ThinkingBudgetExceeded extends IOException {
+        private static final long serialVersionUID = 1L;
+        final int thinkingTokens;
+
+        ThinkingBudgetExceeded(int thinkingTokens) {
+            super("Рассуждение модели превысило бюджет: " + thinkingTokens + " токенов.");
+            this.thinkingTokens = thinkingTokens;
+        }
+    }
+
+    /** Этап генерации для строки состояния. */
+    enum Phase { PROMPT, THINKING, ANSWER }
+
+    /** Где загружена модель: доля в видеопамяти и окно контекста, с которым её загрузил сервер. */
+    record Placement(String model, double gpuShare, int contextTokens) {
+        boolean partlyOnCpu() {
+            return gpuShare < 0.99;
+        }
+
+        int cpuPercent() {
+            return (int) Math.round((1 - gpuShare) * 100);
+        }
+    }
+
+    /** Наблюдатель за ходом генерации; вызывается из потока запроса примерно раз в секунду и при новых токенах. */
+    interface Progress {
+        default void update(Phase phase, int thinkingTokens, int answerTokens, Duration elapsed) {}
+        default void placement(Placement placement) {}
+    }
+
+    /** Подписывает наблюдателя за ходом генерации; адаптер без потоковой передачи может его игнорировать. */
+    default void progress(Progress listener) {}
+
+    /** Где сейчас загружена модель, или {@code null}, если адаптер этого не знает или модель не загружена. */
+    default Placement placement() {
+        return null;
     }
 
     /** Накопленная статистика генерации; адаптер, который её не знает, возвращает {@link Usage#EMPTY}. */

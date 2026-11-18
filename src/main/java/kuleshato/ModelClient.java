@@ -21,6 +21,8 @@ final class ModelClient {
 
     record Compaction(boolean compacted, int tokenEstimate, int remainingEstimate) {}
 
+    /** Бюджет рассуждения на один шаг цикла инструментов, в токенах; при превышении шаг повторяется без Thinking. */
+    static final int TOOL_THINKING_BUDGET = 1536;
     private static final String SUMMARY_MARKER = "Earlier conversation summary (generated locally):";
     private static final int SUMMARY_MAX_CHARS = 12_000;
     private final ModelBackend backend;
@@ -59,8 +61,16 @@ final class ModelClient {
         for (int turn = 0; turn < 20; turn++) {
             if (autoCompact) compact(messages, false, events);
             events.status("thinking");
-            Map<String, Object> assistant = backend.complete(new ModelBackend.Request(
-                messages, toolDefinitions(), false, true, contextWindow, 4096, 0.2, Duration.ofMinutes(10)));
+            ModelBackend.Request request = new ModelBackend.Request(
+                messages, toolDefinitions(), false, true, contextWindow, 4096, 0.2, Duration.ofMinutes(10), TOOL_THINKING_BUDGET);
+            Map<String, Object> assistant;
+            try {
+                assistant = backend.complete(request);
+            } catch (ModelBackend.ThinkingBudgetExceeded exceeded) {
+                // Длинное рассуждение в цикле инструментов почти всегда хуже, чем следующий шаг: повторяем без Thinking.
+                events.status("thinking-cut");
+                assistant = backend.complete(request.withoutThinking());
+            }
             messages.add(assistant);
             String content = assistant.get("content") instanceof String text ? text : "";
             if (!content.isEmpty()) events.assistantText(content);

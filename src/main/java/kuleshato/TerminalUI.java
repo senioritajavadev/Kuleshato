@@ -40,7 +40,8 @@ final class TerminalUI {
         line("  " + dim("Модель: " + model));
         line("  " + dim(workspace));
         line("  " + dim("Java-режим: активен · /help — команды · /exit — выход"));
-        showSkills(skills, enabled);
+        line("  " + dim("Навыки: " + (enabled.isEmpty() ? "не включены" : "включены " + String.join(", ", enabled))
+            + " · доступно " + skills.size() + " — /skills"));
     }
 
     void showSkills(List<Map<String, Object>> skills, List<String> enabled) {
@@ -80,6 +81,27 @@ final class TerminalUI {
         else if (status.equals("compacting")) System.err.print(dim("Kuleshato сжимает историю…"));
         else if (status.equals("planning")) System.err.print(dim("Kuleshato планирует задачу…"));
     }
+    /**
+     * Строка состояния во время генерации: этап, прошедшее время и число токенов. По ней видно, что модель жива,
+     * и сколько она уже рассуждает; без цветного терминала не печатается, чтобы не засорять вывод.
+     */
+    void generation(ModelBackend.Phase phase, int thinkingTokens, int answerTokens, java.time.Duration elapsed) {
+        if (!color) return;
+        String time = String.format(java.util.Locale.ROOT, "%d:%02d", elapsed.toMinutes(), elapsed.toSecondsPart());
+        String stage = switch (phase) {
+            case PROMPT -> "читает запрос";
+            case THINKING -> "рассуждает · " + thinkingTokens + " ток.";
+            case ANSWER -> "отвечает · " + answerTokens + " ток." + (thinkingTokens > 0 ? " (рассуждение " + thinkingTokens + ")" : "");
+        };
+        long seconds = Math.max(1, elapsed.toSeconds());
+        int tokens = thinkingTokens + answerTokens;
+        String speed = tokens > 0 && phase != ModelBackend.Phase.PROMPT
+            ? String.format(java.util.Locale.ROOT, " · ~%.1f ток/с", (double) tokens / seconds) : "";
+        System.err.print("\r\u001b[2K" + dim("Kuleshato " + stage + " · " + time + speed + " · Ctrl+C — прервать"));
+    }
+
+    void warning(String content) { System.err.println("  " + yellow("!") + " " + content); }
+
     void stopThinking() {
         if (color) System.err.print("\r\u001b[2K");
         else System.err.println();
